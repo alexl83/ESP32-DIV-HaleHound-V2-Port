@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <PCF8574.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
@@ -134,17 +135,22 @@ void setBrightness(uint8_t value) {
 static void forceBacklightOff() {
   ledcDetachPin(BACKLIGHT_PIN);
   pinMode(BACKLIGHT_PIN, OUTPUT);
-  digitalWrite(BACKLIGHT_PIN, LOW);
+  digitalWrite(BACKLIGHT_PIN, BACKLIGHT_OFF_LEVEL);
+  gpio_sleep_set_direction((gpio_num_t)BACKLIGHT_PIN, GPIO_MODE_OUTPUT);
+  gpio_sleep_set_pull_mode((gpio_num_t)BACKLIGHT_PIN, GPIO_FLOATING);
+  gpio_sleep_sel_en((gpio_num_t)BACKLIGHT_PIN);
+  gpio_hold_en((gpio_num_t)BACKLIGHT_PIN);
 }
 
 static void restoreBacklightPwm(uint8_t value) {
+  gpio_hold_dis((gpio_num_t)BACKLIGHT_PIN);
+  gpio_sleep_sel_dis((gpio_num_t)BACKLIGHT_PIN);
   ledcAttachPin(BACKLIGHT_PIN, PWM_CHANNEL);
   ledcWrite(PWM_CHANNEL, value);
 }
 
 static void serviceDisplaySleep() {
   static bool sleeping = false;
-  static bool tftSlept = false;
   static bool blForcedOff = false;
   static uint32_t lastSeenInteraction = 0;
   const uint32_t now = millis();
@@ -154,12 +160,6 @@ static void serviceDisplaySleep() {
   if (lastInt != lastSeenInteraction) {
     lastSeenInteraction = lastInt;
     if (sleeping) {
-      if (tftSlept) {
-        tft.writecommand(0x11); // SLPOUT
-        delay(120);
-        tft.writecommand(0x29); // DISPON
-        tftSlept = false;
-      }
       if (blForcedOff) {
         restoreBacklightPwm(settings().brightness);
         blForcedOff = false;
@@ -173,12 +173,6 @@ static void serviceDisplaySleep() {
 
   if (idleTimeoutMs == 0) {
     if (sleeping) {
-      if (tftSlept) {
-        tft.writecommand(0x11); // SLPOUT
-        delay(120);
-        tft.writecommand(0x29); // DISPON
-        tftSlept = false;
-      }
       if (blForcedOff) {
         restoreBacklightPwm(settings().brightness);
         blForcedOff = false;
@@ -192,17 +186,17 @@ static void serviceDisplaySleep() {
   }
 
   if (!sleeping && lastInt > 0 && (now - lastInt) > idleTimeoutMs) {
-    tft.writecommand(0x28); // DISPOFF
-    delay(10);
-    tft.writecommand(0x10); // SLPIN
-    delay(5);
-    tftSlept = true;
+    // Keep panel black on this hardware; DISPOFF/SLPIN produced white screen.
+    tft.fillScreen(TFT_BLACK);
+    drawStatusBar(currentBatteryVoltage, false);
     forceBacklightOff();
     blForcedOff = true;
     sleeping = true;
   }
 
   if (sleeping) {
+    // Re-assert BL off each sleep cycle in case pad state is touched by peripherals.
+    forceBacklightOff();
     // Keep MCU in light sleep while inactive, waking periodically to poll inputs.
     esp_sleep_enable_timer_wakeup(200000); // 200 ms
     esp_light_sleep_start();

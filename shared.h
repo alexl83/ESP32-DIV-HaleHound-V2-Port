@@ -100,6 +100,9 @@ static const uint8_t OBF_WB[]   = {75, 97, 110, 109, 122, 92, 109, 107, 96, 38, 
 #define PWM_CHANNEL     0
 #define PWM_FREQ        5000
 #define PWM_RESOLUTION  8
+#ifndef BACKLIGHT_OFF_LEVEL
+#define BACKLIGHT_OFF_LEVEL LOW
+#endif
 
 /* XPT2046 (Touch) SPI */
 #define XPT2046_CS   18
