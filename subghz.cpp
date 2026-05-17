@@ -1240,6 +1240,7 @@ static bool cacheDirty = true;
 
 static bool deleteArmed = false;
 static uint32_t deleteArmUntilMs = 0;
+static uint32_t saveEnterMs = 0;
 
 static void drawBottomButtons() {
 
@@ -1750,12 +1751,20 @@ void saveSetup() {
     refreshSdIndex(false);
     cacheDirty = true;
     deleteArmed = false;
+    saveEnterMs = millis();
     updateDisplay();
+
+    // Prevent immediate exit caused by the same SELECT press used to enter.
+    uint32_t waitStart = millis();
+    while (isButtonPressed(BTN_SELECT) && (millis() - waitStart < 350)) {
+      delay(10);
+      yield();
+    }
 }
 
 void saveLoop() {
-
-    if (feature_active && isButtonPressed(BTN_SELECT)) {
+    // Ignore SELECT for a short window right after entering Saved Profile.
+    if (feature_active && isButtonPressed(BTN_SELECT) && (millis() - saveEnterMs > 450)) {
         feature_exit_requested = true;
         return;
     }

@@ -74,6 +74,14 @@ namespace Scanner {
   void scannerSetup();
   void scannerLoop();
 }
+namespace Analyzer {
+  void analyzerSetup();
+  void analyzerLoop();
+}
+namespace WLANJammer {
+  void wlanjammerSetup();
+  void wlanjammerLoop();
+}
 namespace ProtoKill {
   void prokillSetup();
   void prokillLoop();

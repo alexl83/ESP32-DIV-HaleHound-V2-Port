@@ -1729,8 +1729,8 @@ void exit() {
 
 namespace Scanner {
 
-#define CE  14
-#define CSN 21
+#define CE  CE_PIN_1
+#define CSN CSN_PIN_1
 
 #define CHANNELS  128
 int channel[CHANNELS];
@@ -1756,6 +1756,33 @@ static constexpr uint16_t BUTTON_POLL_STRIDE = 8;
 int backgroundNoise[CHANNELS] = {0};
 
 volatile bool scanning = true;
+static uint32_t lastSweepHits = 0;
+static uint8_t flatSweepCount = 0;
+static RF24 nrfWarmup(CE_PIN_1, CSN_PIN_1, 16000000);
+static RF24 nrfWarmup2(CE_PIN_2, CSN_PIN_2, 16000000);
+static RF24 nrfWarmup3(CE_PIN_3, CSN_PIN_3, 16000000);
+
+static void warmupOneNrf(RF24& r) {
+  if (!r.begin()) return;
+  r.setAutoAck(false);
+  r.stopListening();
+  r.setRetries(0, 0);
+  r.setPALevel(RF24_PA_MAX, true);
+  r.setDataRate(RF24_2MBPS);
+  r.setCRCLength(RF24_CRC_DISABLED);
+  // ProtoKill-like tiny carrier activity to force stable RF state.
+  r.setChannel(2);
+  r.startConstCarrier(RF24_PA_MAX, 2);
+  delay(2);
+  r.powerDown();
+  delay(2);
+}
+
+static void warmupAllNrfModules() {
+  warmupOneNrf(nrfWarmup);
+  warmupOneNrf(nrfWarmup2);
+  warmupOneNrf(nrfWarmup3);
+}
 
 #define SCREEN_HEIGHT 180
 #define LINE_HEIGHT 12
@@ -1814,6 +1841,50 @@ void setRX() {
   setRegister(_NRF24_CONFIG, getRegister(_NRF24_CONFIG) | 0x01);
   enable();
   delayMicroseconds(100);
+}
+
+bool radioInitAndProbe(uint8_t retries = 4) {
+  warmupAllNrfModules();
+  for (uint8_t k = 0; k < retries; k++) {
+    SPI.end();
+    delay(6);
+
+    pinMode(CC1101_CS, OUTPUT);
+    digitalWrite(CC1101_CS, HIGH);
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+
+    SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, CSN);
+    SPI.setDataMode(SPI_MODE0);
+    SPI.setFrequency(10000000);
+    SPI.setBitOrder(MSBFIRST);
+
+    pinMode(CE, OUTPUT);
+    pinMode(CSN, OUTPUT);
+    disable();
+    digitalWrite(CSN, HIGH);
+    delayMicroseconds(80);
+
+    powerDown();
+    delayMicroseconds(200);
+    powerUp();
+    setRegister(_NRF24_EN_AA, 0x00);
+    setRegister(_NRF24_RF_SETUP, 0x0F);
+    setRegister(_NRF24_CONFIG, 0x03); // PWR_UP + PRIM_RX
+    setRegister(_NRF24_RF_CH, 40);
+    const byte chProbe = getRegister(_NRF24_RF_CH);
+    enable();
+    delayMicroseconds(160);
+    disable();
+
+    const byte st = getRegister(0x07);
+    if (st != 0x00 && st != 0xFF && chProbe == 40) {
+      flatSweepCount = 0;
+      return true;
+    }
+    delay(20);
+  }
+  return false;
 }
 
 void scroll() {
@@ -1985,6 +2056,7 @@ void runUI() {
 }
 
 void scanChannels() {
+  lastSweepHits = 0;
   disable();
   static uint32_t lastUI = 0;
   for (int j = 0; j < (int)SCAN_SWEEPS && scanning; j++) {
@@ -2004,7 +2076,10 @@ void scanChannels() {
       enable();
       delayMicroseconds(RX_SETTLE_US + RPD_DWELL_US);
       disable();
-      if (carrierDetected()) channel[i]++;
+      if (carrierDetected()) {
+        channel[i]++;
+        lastSweepHits++;
+      }
 
       uint32_t now = millis();
       if (now - lastUI >= UI_THROTTLE_MS) {
@@ -2122,6 +2197,9 @@ void display() {
 }
 
 void scannerSetup() {
+    tft.init();
+    tft.setRotation(2);
+
 
   tft.fillScreen(TFT_BLACK);
 
@@ -2137,21 +2215,7 @@ void scannerSetup() {
   Print(" ", TFT_GREEN, false);
   Print("[*] 2.4GHz Scanner Initialized...", TFT_GREEN, false);
 
-  SPI.begin(13, 11, 12, 4);
-  SPI.setDataMode(SPI_MODE0);
-  SPI.setFrequency(10000000);
-  SPI.setBitOrder(MSBFIRST);
-
-  pinMode(CE, OUTPUT);
-  pinMode(CSN, OUTPUT);
-
-  disable();
-  powerUp();
-
-  setRegister(_NRF24_CONFIG, getRegister(_NRF24_CONFIG) | 0x03);
-  delayMicroseconds(130);
-  setRegister(_NRF24_EN_AA, 0x0);
-  setRegister(_NRF24_RF_SETUP, 0x0F);
+  radioInitAndProbe();
 
   scanning = true;
 }
@@ -2177,12 +2241,1097 @@ void scannerLoop() {
     }
     runUI();
     scanChannels();
+    if (lastSweepHits == 0) {
+      if (++flatSweepCount >= 3) {
+        Print("[!] Reinit NRF24...", TFT_YELLOW, false);
+        radioInitAndProbe(5);
+        flatSweepCount = 0;
+      }
+    } else {
+      flatSweepCount = 0;
+    }
     outputChannels();
     display();
     delay(5);
     }
   }
 }
+
+namespace Analyzer {
+
+#define ANA_CE  CE_PIN_1
+#define ANA_CSN CSN_PIN_1
+#define ANA_CHANNELS 85           // WiFi-only: 2400-2484 MHz (same as Scanner)
+
+// Data arrays
+uint8_t current_levels[ANA_CHANNELS];
+uint8_t peak_levels[ANA_CHANNELS];
+unsigned long lastScanTime = 0;
+unsigned long lastDisplayTime = 0;
+bool analyzerRunning = true;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WATERFALL CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+#define WATERFALL_HEIGHT 100      // Waterfall area height in pixels
+#define WATERFALL_Y 215           // Waterfall starts below spectrum (after axes/labels)
+
+// Waterfall history buffer - stores signal levels for each row
+// Each row = one scan, scrolls down over time
+uint8_t waterfall_buffer[WATERFALL_HEIGHT][ANA_CHANNELS];
+int waterfall_row = 0;            // Current row being written to (circular buffer index)
+bool waterfall_initialized = false;
+
+// Color palette for waterfall (128 colors from black through teal to magenta)
+uint16_t waterfall_palette[64];
+
+// WiFi channel positions (NRF24 channel numbers)
+// WiFi Ch 1 = 2412 MHz = NRF Ch 12
+// WiFi Ch 6 = 2437 MHz = NRF Ch 37
+// WiFi Ch 11 = 2462 MHz = NRF Ch 62
+// WiFi Ch 13 = 2472 MHz = NRF Ch 72
+const int WIFI_CH1 = 12;
+const int WIFI_CH6 = 37;
+const int WIFI_CH11 = 62;
+const int WIFI_CH13 = 72;
+
+// Display constants - SPECTRUM GRAPH (upper portion)
+#define GRAPH_X 10
+#define GRAPH_Y 50              // Start after header
+#define GRAPH_WIDTH 220
+#define GRAPH_HEIGHT 120        // Reduced to make room for waterfall
+#define BAR_WIDTH 1
+
+// NRF24 register definitions (same as Scanner)
+#define _ANA_NRF24_CONFIG   0x00
+#define _ANA_NRF24_EN_AA    0x01
+#define _ANA_NRF24_RF_CH    0x05
+#define _ANA_NRF24_RF_SETUP 0x06
+#define _ANA_NRF24_RPD      0x09
+
+byte anaGetRegister(byte r) {
+    byte c;
+    digitalWrite(ANA_CSN, LOW);
+    SPI.transfer(r & 0x1F);
+    c = SPI.transfer(0);
+    digitalWrite(ANA_CSN, HIGH);
+    return c;
+}
+
+void anaSetRegister(byte r, byte v) {
+    digitalWrite(ANA_CSN, LOW);
+    SPI.transfer((r & 0x1F) | 0x20);
+    SPI.transfer(v);
+    digitalWrite(ANA_CSN, HIGH);
+}
+
+void anaPowerUp() {
+    anaSetRegister(_ANA_NRF24_CONFIG, anaGetRegister(_ANA_NRF24_CONFIG) | 0x02);
+    delayMicroseconds(130);
+}
+
+void anaEnable() {
+    digitalWrite(ANA_CE, HIGH);
+}
+
+void anaSetRX() {
+    anaSetRegister(_ANA_NRF24_CONFIG, anaGetRegister(_ANA_NRF24_CONFIG) | 0x01);
+    digitalWrite(ANA_CE, HIGH);
+    delayMicroseconds(100);
+}
+
+void anaDisable() {
+    digitalWrite(ANA_CE, LOW);
+}
+
+bool anaCarrierDetected() {
+    return anaGetRegister(_ANA_NRF24_RPD) & 0x01;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WATERFALL WITH MAGENTA -> TEAL VERTICAL GRADIENT
+// Top of waterfall = Magenta/Pink (#FF16A0)
+// Bottom of waterfall = Cyan/Teal (#23D2C3)
+// Dots shift color as they scroll down - LOOKS RAD AS FUCK
+// ═══════════════════════════════════════════════════════════════════════════
+
+void initWaterfallPalette() {
+    // No longer using palette - colors calculated per-pixel based on position
+    waterfall_initialized = true;
+}
+
+// HaleHound gradient waterfall
+// Top (row 0) = Magenta/Pink, Bottom (row max) = Cyan
+// Signal strength adjusts brightness
+uint16_t getGradientWaterfallColor(uint8_t level, int row, int maxRows) {
+    if (level == 0) return TFT_BLACK;
+
+    // Calculate vertical position ratio (0.0 = top, 1.0 = bottom)
+    float vRatio = (float)row / (float)(maxRows - 1);
+
+    // Top color: Hot Pink - RGB(255, 28, 82)
+    // Bottom color: Cyan - RGB(0, 207, 255)
+    uint8_t r = 255 - (uint8_t)(vRatio * 255);    // 255 -> 0
+    uint8_t g = 28 + (uint8_t)(vRatio * 179);     // 28 -> 207
+    uint8_t b = 82 + (uint8_t)(vRatio * 173);     // 82 -> 255
+
+    // Adjust brightness based on signal level (1-30 typical range)
+    // Weak signals = dimmer, strong signals = full bright
+    float brightness;
+    if (level < 3) {
+        brightness = 0.4f + (level * 0.1f);  // 0.5 - 0.7
+    } else if (level < 10) {
+        brightness = 0.7f + ((level - 3) * 0.03f);  // 0.7 - 0.91
+    } else {
+        brightness = 0.91f + ((level - 10) * 0.009f);  // 0.91 - 1.0
+        if (brightness > 1.0f) brightness = 1.0f;
+    }
+
+    r = (uint8_t)(r * brightness);
+    g = (uint8_t)(g * brightness);
+    b = (uint8_t)(b * brightness);
+
+    // Convert to RGB565
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WATERFALL DRAWING
+// ═══════════════════════════════════════════════════════════════════════════
+void updateWaterfall() {
+    // Store current scan data into waterfall buffer at current row
+    for (int ch = 0; ch < ANA_CHANNELS; ch++) {
+        waterfall_buffer[waterfall_row][ch] = current_levels[ch];
+    }
+
+    // Advance to next row (circular buffer)
+    waterfall_row++;
+    if (waterfall_row >= WATERFALL_HEIGHT) {
+        waterfall_row = 0;
+    }
+}
+
+void drawWaterfall() {
+    // Clear waterfall area to black
+    tft.fillRect(GRAPH_X, WATERFALL_Y, GRAPH_WIDTH, WATERFALL_HEIGHT, TFT_BLACK);
+
+    // Draw waterfall - newest at top (magenta), oldest at bottom (cyan)
+    int screenY = WATERFALL_Y;  // Start at TOP
+    int bufferIdx = waterfall_row - 1;  // Most recent data
+    if (bufferIdx < 0) bufferIdx = WATERFALL_HEIGHT - 1;
+
+    for (int row = 0; row < WATERFALL_HEIGHT; row++) {
+        for (int ch = 0; ch < ANA_CHANNELS; ch++) {
+            uint8_t level = waterfall_buffer[bufferIdx][ch];
+
+            // Only draw if signal exists
+            if (level > 0) {
+                int x = GRAPH_X + (ch * GRAPH_WIDTH / ANA_CHANNELS);
+                uint16_t color = getGradientWaterfallColor(level, row, WATERFALL_HEIGHT);
+                tft.drawPixel(x, screenY, color);
+            }
+        }
+
+        screenY++;  // Move down on screen
+        bufferIdx--;  // Move backward in buffer (older data)
+        if (bufferIdx < 0) {
+            bufferIdx = WATERFALL_HEIGHT - 1;
+        }
+    }
+}
+
+void clearWaterfallBuffer() {
+    memset(waterfall_buffer, 0, sizeof(waterfall_buffer));
+    waterfall_row = 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXISTING FUNCTIONS (MODIFIED FOR NEW LAYOUT)
+// ═══════════════════════════════════════════════════════════════════════════
+
+void drawWiFiMarkers() {
+    // Draw vertical lines for WiFi channels on spectrum
+    int x1 = GRAPH_X + (WIFI_CH1 * GRAPH_WIDTH / ANA_CHANNELS);
+    int x6 = GRAPH_X + (WIFI_CH6 * GRAPH_WIDTH / ANA_CHANNELS);
+    int x11 = GRAPH_X + (WIFI_CH11 * GRAPH_WIDTH / ANA_CHANNELS);
+    int x13 = GRAPH_X + (WIFI_CH13 * GRAPH_WIDTH / ANA_CHANNELS);
+
+    // Draw dashed lines on spectrum (1, 6, 11 magenta, 13 yellow)
+    for (int y = GRAPH_Y; y < GRAPH_Y + GRAPH_HEIGHT; y += 4) {
+        tft.drawPixel(x1, y, ORANGE);
+        tft.drawPixel(x6, y, ORANGE);
+        tft.drawPixel(x11, y, ORANGE);
+        tft.drawPixel(x13, y, TFT_YELLOW);
+    }
+
+    // Also draw on waterfall area
+    for (int y = WATERFALL_Y; y < WATERFALL_Y + WATERFALL_HEIGHT; y += 6) {
+        tft.drawPixel(x1, y, TFT_DARKGREY);
+        tft.drawPixel(x6, y, TFT_DARKGREY);
+        tft.drawPixel(x11, y, TFT_DARKGREY);
+        tft.drawPixel(x13, y, TFT_DARKGREY);
+    }
+
+    // Labels above spectrum
+    tft.setTextColor(ORANGE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(x1 - 4, GRAPH_Y - 10);
+    tft.print("1");
+    tft.setCursor(x6 - 4, GRAPH_Y - 10);
+    tft.print("6");
+    tft.setCursor(x11 - 8, GRAPH_Y - 10);
+    tft.print("11");
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(x13 - 8, GRAPH_Y - 10);
+    tft.print("13");
+}
+
+void drawAxes() {
+    // Y-axis for spectrum
+    tft.drawLine(GRAPH_X - 2, GRAPH_Y, GRAPH_X - 2, GRAPH_Y + GRAPH_HEIGHT, WHITE);
+    // X-axis for spectrum
+    tft.drawLine(GRAPH_X, GRAPH_Y + GRAPH_HEIGHT, GRAPH_X + GRAPH_WIDTH, GRAPH_Y + GRAPH_HEIGHT, WHITE);
+
+    // Frequency labels between spectrum and waterfall
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(GRAPH_X - 5, GRAPH_Y + GRAPH_HEIGHT + 3);
+    tft.print("2400");
+    tft.setCursor(GRAPH_X + GRAPH_WIDTH/2 - 15, GRAPH_Y + GRAPH_HEIGHT + 3);
+    tft.print("2442");
+    tft.setCursor(GRAPH_X + GRAPH_WIDTH - 25, GRAPH_Y + GRAPH_HEIGHT + 3);
+    tft.print("2484");
+
+    // Divider line before waterfall
+    tft.drawLine(0, WATERFALL_Y - 2, 240, WATERFALL_Y - 2, ORANGE);
+
+    // Waterfall label
+    tft.setTextColor(ORANGE, TFT_BLACK);
+    tft.setCursor(85, WATERFALL_Y + WATERFALL_HEIGHT + 2);
+    tft.print("WATERFALL");
+}
+
+void drawSpectrum() {
+    // Clear spectrum graph area only (not waterfall)
+    tft.fillRect(GRAPH_X, GRAPH_Y, GRAPH_WIDTH, GRAPH_HEIGHT, TFT_BLACK);
+
+    // Draw WiFi channel markers first (behind bars)
+    drawWiFiMarkers();
+
+    // Find max for scaling reference
+    uint8_t maxLevel = 1;
+    for (int i = 0; i < ANA_CHANNELS; i++) {
+        if (current_levels[i] > maxLevel) maxLevel = current_levels[i];
+    }
+
+    // Draw spectrum bars - TEAL TO MAGENTA GRADIENT
+    for (int i = 0; i < ANA_CHANNELS; i++) {
+        int x = GRAPH_X + (i * GRAPH_WIDTH / ANA_CHANNELS);
+
+        // Current level bar - scaled to visible range
+        int barHeight = (current_levels[i] * GRAPH_HEIGHT) / 30;
+        if (barHeight < 3 && current_levels[i] > 0) barHeight = 3;  // Minimum visible
+        if (barHeight > GRAPH_HEIGHT) barHeight = GRAPH_HEIGHT;
+
+        if (barHeight > 0) {
+            // HaleHound gradient - Teal to Pink
+            for (int y = 0; y < barHeight; y++) {
+                float ratio = (float)y / (float)GRAPH_HEIGHT;
+
+                // Teal RGB(0, 207, 255) -> Hot Pink RGB(255, 28, 82)
+                uint8_t r = 0 + (uint8_t)(ratio * 255);
+                uint8_t g = 207 - (uint8_t)(ratio * 179);
+                uint8_t b = 255 - (uint8_t)(ratio * 173);
+
+                uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+                int drawY = GRAPH_Y + GRAPH_HEIGHT - barHeight + y;
+                tft.drawFastHLine(x, drawY, BAR_WIDTH, color);
+            }
+        }
+
+        // Peak hold indicator (small dot at peak)
+        if (peak_levels[i] > 0) {
+            int peakY = GRAPH_Y + GRAPH_HEIGHT - (peak_levels[i] * GRAPH_HEIGHT / 30);
+            if (peakY < GRAPH_Y) peakY = GRAPH_Y;
+            tft.drawPixel(x, peakY, TFT_WHITE);
+        }
+    }
+
+    // Update and draw waterfall
+    updateWaterfall();
+    drawWaterfall();
+}
+
+void scanAllChannels() {
+    // Reset current levels
+    memset(current_levels, 0, sizeof(current_levels));
+
+    // Scan each channel multiple times for better detection
+    for (int sample = 0; sample < 30 && analyzerRunning; sample++) {
+        // Check button every sample to prevent freeze
+        if (pcf.digitalRead(BTN_SELECT) == LOW) {
+            analyzerRunning = false;
+            feature_exit_requested = true;
+            return;
+        }
+
+        for (int ch = 0; ch < ANA_CHANNELS && analyzerRunning; ch++) {
+            Scanner::setRegister(0x05, (uint8_t)ch);
+            Scanner::enable();
+            delayMicroseconds(140);
+            Scanner::disable();
+            if (Scanner::carrierDetected()) {
+                current_levels[ch]++;
+            }
+        }
+    }
+
+    // Update peak levels
+    for (int i = 0; i < ANA_CHANNELS; i++) {
+        if (current_levels[i] > peak_levels[i]) {
+            peak_levels[i] = current_levels[i];
+        }
+    }
+}
+
+void drawHeader() {
+    tft.fillRect(0, 20, 240, 18, TFT_BLACK);
+
+    // Title
+    tft.setTextColor(ORANGE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(45, 22);
+    tft.print("2.4GHz SPECTRUM ANALYZER");
+
+    // Divider line
+    tft.drawLine(0, 38, 240, 38, ORANGE);
+
+    // Find peak frequency
+    int peakCh = 0;
+    uint8_t peakVal = 0;
+    for (int i = 0; i < ANA_CHANNELS; i++) {
+        if (current_levels[i] > peakVal) {
+            peakVal = current_levels[i];
+            peakCh = i;
+        }
+    }
+
+    // Peak info in status area (use status bar area or below header)
+    // Will be shown in bottom area instead to save space
+}
+
+void drawStatusArea() {
+    // Draw status info at very bottom of screen
+    tft.fillRect(0, 310, 240, 10, TFT_BLACK);
+
+    // Find peak
+    int peakCh = 0;
+    uint8_t peakVal = 0;
+    for (int i = 0; i < ANA_CHANNELS; i++) {
+        if (current_levels[i] > peakVal) {
+            peakVal = current_levels[i];
+            peakCh = i;
+        }
+    }
+
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(5, 310);
+    tft.printf("Peak:%dMHz Lv:%d", 2400 + peakCh, peakVal);
+
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(140, 310);
+    tft.print("SEL:Exit L:Rst");
+}
+
+void resetPeaks() {
+    memset(peak_levels, 0, sizeof(peak_levels));
+    clearWaterfallBuffer();  // Also clear waterfall when resetting
+}
+
+void analyzerSetup() {
+    tft.init();
+    tft.setRotation(2);
+    tft.fillScreen(TFT_BLACK);
+
+    // Initialize waterfall color palette
+    initWaterfallPalette();
+
+    // Initialize arrays
+    memset(current_levels, 0, sizeof(current_levels));
+    memset(peak_levels, 0, sizeof(peak_levels));
+    clearWaterfallBuffer();
+
+    // Draw static UI elements
+    drawHeader();
+    drawAxes();
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SubGHz Cleanup - Release pin 16 and SPI bus before nRF24 init
+    // Pin 16 is shared: CC1101 GDO0/RX (with interrupt) AND nRF24 CE (GPIO output)
+    // ONLY cleanup if SubGHz receive was actually enabled (prevents crash)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const bool radioOk = Scanner::radioInitAndProbe();
+    (void)radioOk;
+    setupTouchscreen();
+
+    analyzerRunning = true;
+    lastScanTime = millis();
+    lastDisplayTime = millis();
+
+    float voltage = readBatteryVoltage();
+    drawStatusBar(voltage, false);
+
+    // Initial status area
+    drawStatusArea();
+}
+
+void analyzerLoop() {
+    // Check for exit button
+    if (pcf.digitalRead(BTN_SELECT) == LOW) {
+        analyzerRunning = false;
+        feature_exit_requested = true;
+        // Reinitialize touch SPI before exiting - NRF24 reconfigured SPI bus
+        setupTouchscreen();
+        delay(200);
+        return;
+    }
+
+    // Check for reset peaks button (LEFT)
+    if (pcf.digitalRead(BTN_LEFT) == LOW) {
+        resetPeaks();
+        delay(200);
+    }
+
+    // Continuous scanning
+    scanAllChannels();
+    bool any = false;
+    for (int i = 0; i < ANA_CHANNELS; i++) {
+      if (current_levels[i] > 0) { any = true; break; }
+    }
+    if (!any) {
+      if (++Scanner::flatSweepCount >= 3) {
+        Scanner::radioInitAndProbe(5);
+        Scanner::flatSweepCount = 0;
+      }
+    } else {
+      Scanner::flatSweepCount = 0;
+    }
+
+    // Update display at ~15 FPS
+    if (millis() - lastDisplayTime >= 66) {
+        drawSpectrum();
+        drawStatusArea();
+        lastDisplayTime = millis();
+    }
+}
+
+}  // namespace Analyzer
+
+
+/*
+ *
+ * 2.4GHz WLAN Jammer - WiFi-specific jamming with correct channel mapping
+ * Uses single NRF24L01 with rapid channel hopping
+ *
+*/
+
+namespace WLANJammer {
+
+#define WLAN_CE  CE_PIN_1
+#define WLAN_CSN CSN_PIN_1
+
+// WiFi channel center frequencies mapped to NRF24 channels
+// WiFi Ch X center = 2407 + (X * 5) MHz
+// NRF24 channel = frequency - 2400
+// WiFi channels are ~22MHz wide, so we sweep ±11 channels around center
+
+// WiFi channel start/end NRF24 channels (covering 22MHz width)
+const uint8_t WIFI_CH_START[] = {1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56, 61};  // Ch 1-13
+const uint8_t WIFI_CH_END[] =   {23, 28, 33, 38, 43, 48, 53, 58, 63, 68, 73, 78, 83}; // Ch 1-13
+const uint8_t WIFI_CH_CENTER[] = {12, 17, 22, 27, 32, 37, 42, 47, 52, 57, 62, 67, 72}; // Centers
+
+#define NUM_WIFI_CHANNELS 13
+#define ALL_CHANNELS_MODE 0
+
+// NRF24 register addresses
+#define NRF_CONFIG      0x00
+#define NRF_EN_AA       0x01
+#define NRF_RF_CH       0x05
+#define NRF_RF_SETUP    0x06
+#define NRF_STATUS      0x07
+#define NRF_RPD         0x09
+
+// Direct SPI functions (same technique as working Analyzer)
+byte wlanGetReg(byte reg) {
+    byte val;
+    digitalWrite(WLAN_CSN, LOW);
+    SPI.transfer(reg & 0x1F);
+    val = SPI.transfer(0);
+    digitalWrite(WLAN_CSN, HIGH);
+    return val;
+}
+
+void wlanSetReg(byte reg, byte val) {
+    digitalWrite(WLAN_CSN, LOW);
+    SPI.transfer((reg & 0x1F) | 0x20);
+    SPI.transfer(val);
+    digitalWrite(WLAN_CSN, HIGH);
+}
+
+void wlanSetChannel(byte ch) {
+    wlanSetReg(NRF_RF_CH, ch);
+}
+
+void wlanPowerUp() {
+    wlanSetReg(NRF_CONFIG, wlanGetReg(NRF_CONFIG) | 0x02);
+    delayMicroseconds(1500);  // Power-up delay
+}
+
+void wlanPowerDown() {
+    wlanSetReg(NRF_CONFIG, wlanGetReg(NRF_CONFIG) & ~0x02);
+}
+
+void wlanEnableRX() {
+    wlanSetReg(NRF_CONFIG, wlanGetReg(NRF_CONFIG) | 0x01);  // PRIM_RX
+    digitalWrite(WLAN_CE, HIGH);
+    delayMicroseconds(130);
+}
+
+void wlanDisable() {
+    digitalWrite(WLAN_CE, LOW);
+}
+
+bool wlanCarrierDetected() {
+    return wlanGetReg(NRF_RPD) & 0x01;
+}
+
+// Start constant carrier (jamming)
+void wlanStartCarrier(byte channel) {
+    wlanSetChannel(channel);
+    // RF_SETUP: CONT_WAVE=1 (bit7), PLL_LOCK=1 (bit4), 0dBm power
+    wlanSetReg(NRF_RF_SETUP, 0x9E);
+    digitalWrite(WLAN_CE, HIGH);
+}
+
+// Stop constant carrier
+void wlanStopCarrier() {
+    wlanDisable();
+    wlanSetReg(NRF_RF_SETUP, 0x0F);
+}
+
+bool jammerActive = false;
+int currentWiFiChannel = ALL_CHANNELS_MODE;  // 0 = ALL, 1-13 = specific channel
+int currentNRFChannel = 0;
+unsigned long lastHopTime = 0;
+unsigned long lastDisplayTime = 0;
+unsigned long lastScanTime = 0;
+const int HOP_DELAY_US = 500;  // Microseconds between channel hops
+const int SCAN_INTERVAL_MS = 2000;  // Scan signals every 2 seconds
+
+// Signal detection (to verify jamming effectiveness)
+uint8_t signalLevels[13] = {0};  // 0-100% signal detected per WiFi channel
+uint8_t signalHistory[13][5];    // Rolling history for smoothing
+uint8_t historyIndex = 0;
+
+// Display constants
+#define JAM_GRAPH_X 10
+#define JAM_GRAPH_Y 100
+#define JAM_GRAPH_WIDTH 220
+#define JAM_GRAPH_HEIGHT 150
+
+volatile bool modeChangeRequested = false;
+volatile bool jammerToggleRequested = false;
+unsigned long lastButtonPressTime = 0;
+const unsigned long debounceDelay = 300;
+
+// Forward declarations
+void configureRadio();
+
+void drawHeader() {
+    tft.fillRect(0, 0, 240, 50, TFT_BLACK);
+
+    // Title
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(60, 5);
+    tft.print("2.4GHz WLAN JAMMER");
+
+    // Status
+    tft.setTextColor(jammerActive ? TFT_RED : TFT_GREEN, TFT_BLACK);
+    tft.setCursor(80, 20);
+    tft.printf("Status: %s", jammerActive ? "JAMMING" : "STANDBY");
+
+    // Current mode
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setCursor(10, 35);
+    if (currentWiFiChannel == ALL_CHANNELS_MODE) {
+        tft.print("Mode: ALL WiFi Channels (1-13)");
+    } else {
+        int freq = 2407 + (currentWiFiChannel * 5);
+        tft.printf("Mode: WiFi Ch %d (%d MHz)", currentWiFiChannel, freq);
+    }
+
+    // Divider
+    tft.drawLine(0, 50, 240, 50, TFT_RED);
+}
+
+void drawButtonGuide() {
+    tft.fillRect(0, 270, 240, 50, TFT_BLACK);
+
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+
+    // UP = Toggle jammer
+    tft.setCursor(10, 275);
+    tft.print("UP: Toggle ON/OFF");
+
+    // LEFT/RIGHT = Change channel
+    tft.setCursor(10, 290);
+    tft.print("L/R: Change WiFi Channel");
+
+    // SELECT = Exit
+    tft.setCursor(10, 305);
+    tft.print("SELECT: Exit");
+}
+
+void drawChannelDisplay() {
+    // Position: below signal bars (77) - channel numbers
+    int channelY = 80;
+    tft.fillRect(JAM_GRAPH_X, channelY, JAM_GRAPH_WIDTH, 15, TFT_BLACK);
+
+    // Draw WiFi channel indicators
+    tft.setTextSize(1);
+    for (int ch = 1; ch <= 13; ch++) {
+        int x = JAM_GRAPH_X + ((ch - 1) * JAM_GRAPH_WIDTH / 13);
+
+        // Highlight selected channel(s)
+        if (currentWiFiChannel == ALL_CHANNELS_MODE || currentWiFiChannel == ch) {
+            if (jammerActive) {
+                tft.setTextColor(TFT_RED, TFT_BLACK);
+            } else {
+                tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+            }
+        } else {
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        }
+
+        tft.setCursor(x + 2, channelY);
+        if (ch < 10) {
+            tft.printf(" %d", ch);  // Align single digits
+        } else {
+            tft.printf("%d", ch);
+        }
+    }
+}
+
+void drawSpectrumBar() {
+    // Clear graph area
+    tft.fillRect(JAM_GRAPH_X, JAM_GRAPH_Y, JAM_GRAPH_WIDTH, JAM_GRAPH_HEIGHT, TFT_BLACK);
+
+    // Draw border
+    tft.drawRect(JAM_GRAPH_X - 1, JAM_GRAPH_Y - 1, JAM_GRAPH_WIDTH + 2, JAM_GRAPH_HEIGHT + 2, WHITE);
+
+    if (!jammerActive) {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.setCursor(JAM_GRAPH_X + 60, JAM_GRAPH_Y + 70);
+        tft.print("JAMMER INACTIVE");
+        return;
+    }
+
+    // Draw activity bar for current NRF24 channel
+    int barWidth = JAM_GRAPH_WIDTH / 126;  // 126 NRF24 channels (0-125)
+    if (barWidth < 2) barWidth = 2;
+
+    int x = JAM_GRAPH_X + (currentNRFChannel * JAM_GRAPH_WIDTH / 126);
+
+    // Draw the jamming bar
+    tft.fillRect(x, JAM_GRAPH_Y + 10, barWidth, JAM_GRAPH_HEIGHT - 20, TFT_RED);
+
+    // Show current NRF24 channel
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setCursor(JAM_GRAPH_X + JAM_GRAPH_WIDTH/2 - 40, JAM_GRAPH_Y + JAM_GRAPH_HEIGHT + 5);
+    tft.printf("NRF24 Ch: %d (%d MHz)", currentNRFChannel, 2400 + currentNRFChannel);
+
+    // Highlight WiFi channel regions
+    for (int ch = 1; ch <= 13; ch++) {
+        if (currentWiFiChannel == ALL_CHANNELS_MODE || currentWiFiChannel == ch) {
+            int startX = JAM_GRAPH_X + (WIFI_CH_START[ch-1] * JAM_GRAPH_WIDTH / 126);
+            int endX = JAM_GRAPH_X + (WIFI_CH_END[ch-1] * JAM_GRAPH_WIDTH / 126);
+            tft.drawRect(startX, JAM_GRAPH_Y + 2, endX - startX, JAM_GRAPH_HEIGHT - 4, TFT_YELLOW);
+        }
+    }
+}
+
+// Scan signals using DIRECT SPI - exact same as Scanner's scanChannels()
+void scanSignals() {
+    bool wasJamming = jammerActive;
+    int savedChannel = currentNRFChannel;
+
+    // Stop jamming to scan
+    if (wasJamming) {
+        wlanStopCarrier();
+        jammerActive = false;
+    }
+
+    Scanner::disable();
+    Scanner::powerUp();
+    Scanner::setRegister(0x01, 0x00);
+    Scanner::setRegister(0x06, 0x0F);
+
+    // Scan each WiFi channel - use Scanner's scanChannels() pattern
+    for (int wifiCh = 0; wifiCh < 13; wifiCh++) {
+        int detections = 0;
+        int totalSamples = 0;
+
+        // Sample across the WiFi channel bandwidth
+        for (int nrfCh = WIFI_CH_START[wifiCh]; nrfCh <= WIFI_CH_END[wifiCh]; nrfCh += 2) {
+            // Multiple samples per NRF channel (like Scanner's 50 cycles)
+            for (int s = 0; s < 5; s++) {
+                Scanner::setRegister(0x05, (uint8_t)nrfCh);
+                Scanner::enable();
+                delayMicroseconds(140);
+                Scanner::disable();
+                if (Scanner::carrierDetected()) {
+                    detections++;
+                }
+                totalSamples++;
+            }
+        }
+
+        // Calculate signal level with balanced 5x boost
+        // Raw detection rate: 2%=weak, 5%=low, 10%=medium, 20%=strong
+        // After 5x: 10%=weak, 25%=low, 50%=medium, 100%=strong
+        int rawPct = (totalSamples > 0) ? (detections * 100) / totalSamples : 0;
+        int boostedPct = rawPct * 5;  // Balanced 5x boost
+        if (boostedPct > 100) boostedPct = 100;
+
+        // Store with light smoothing (avg of current + last)
+        signalHistory[wifiCh][historyIndex] = boostedPct;
+        signalLevels[wifiCh] = (signalHistory[wifiCh][historyIndex] +
+                                signalHistory[wifiCh][(historyIndex + 4) % 5]) / 2;
+
+        // If ANY detection, ensure visible (minimum 10%)
+        if (detections > 0 && signalLevels[wifiCh] < 10) {
+            signalLevels[wifiCh] = 10;
+        }
+    }
+
+    historyIndex = (historyIndex + 1) % 5;
+
+    // Resume jamming if it was active
+    if (wasJamming) {
+        wlanStartCarrier(savedChannel);
+        currentNRFChannel = savedChannel;
+        jammerActive = true;
+    }
+
+    lastScanTime = millis();
+}
+
+// Draw signal level bars for each WiFi channel
+void drawSignalBars() {
+    // Position: below header (55) but above channel numbers (65)
+    int legendY = 52;
+    int barAreaY = 65;
+    int barHeight = 12;
+    int barSpacing = JAM_GRAPH_WIDTH / 13;
+
+    // Legend
+    tft.setTextSize(1);
+    tft.fillRect(JAM_GRAPH_X, legendY, JAM_GRAPH_WIDTH, 10, TFT_BLACK);
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setCursor(JAM_GRAPH_X, legendY);
+    tft.print("SIGNAL: ");
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.print("HI ");
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.print("MED ");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("LOW/JAM");
+
+    for (int ch = 0; ch < 13; ch++) {
+        int x = JAM_GRAPH_X + (ch * barSpacing);
+        int barWidth = barSpacing - 2;
+
+        // Clear area for this bar
+        tft.fillRect(x, barAreaY, barWidth, barHeight, TFT_BLACK);
+
+        // Draw signal strength bar (vertical fill from bottom)
+        int fillHeight = (signalLevels[ch] * barHeight) / 100;
+        if (fillHeight < 1 && signalLevels[ch] > 0) fillHeight = 1;
+
+        if (fillHeight > 0) {
+            // Color based on signal level (green = signal, red = no signal/jammed)
+            uint16_t color;
+            if (signalLevels[ch] > 60) {
+                color = TFT_GREEN;  // Strong signal (not jammed well)
+            } else if (signalLevels[ch] > 30) {
+                color = TFT_YELLOW;  // Medium signal
+            } else {
+                color = TFT_RED;  // Weak signal (jammed!)
+            }
+
+            // Fill from bottom up
+            tft.fillRect(x, barAreaY + barHeight - fillHeight, barWidth, fillHeight, color);
+        }
+
+        // Draw border
+        tft.drawRect(x, barAreaY, barWidth, barHeight, TFT_DARKGREY);
+    }
+}
+
+// Initialize NRF24 for jamming (direct SPI - no RF24 library)
+void initJammerRadio() {
+    // Ensure pins are ready
+    digitalWrite(WLAN_CE, LOW);
+    digitalWrite(WLAN_CSN, HIGH);
+    delay(5);
+
+    // Power up
+    wlanPowerUp();
+
+    // Configure for jamming: no auto-ack, no CRC, 2Mbps, max power
+    wlanSetReg(NRF_EN_AA, 0x00);      // Disable auto-ack
+    wlanSetReg(NRF_CONFIG, 0x02);     // PWR_UP, PTX mode (not RX)
+}
+
+void startJamming() {
+    // Verify NRF24 is responding
+    byte status = Scanner::getRegister(0x07);
+    if (status == 0x00 || status == 0xFF) {
+        // Try to reinit
+        wlanDisable();
+        wlanPowerUp();
+        wlanSetReg(NRF_EN_AA, 0x00);
+        wlanSetReg(NRF_RF_SETUP, 0x0F);
+        status = Scanner::getRegister(0x07);
+        if (status == 0x00 || status == 0xFF) {
+            tft.setTextColor(TFT_RED, TFT_BLACK);
+            tft.setCursor(10, 150);
+            tft.print("ERROR: NRF24 not found!");
+            return;
+        }
+    }
+
+    // Start carrier on initial channel
+    if (currentWiFiChannel == ALL_CHANNELS_MODE) {
+        currentNRFChannel = WIFI_CH_START[0];
+    } else {
+        currentNRFChannel = WIFI_CH_START[currentWiFiChannel - 1];
+    }
+
+    wlanStartCarrier(currentNRFChannel);
+    jammerActive = true;
+    lastHopTime = micros();
+}
+
+void stopJamming() {
+    wlanStopCarrier();
+    wlanPowerDown();
+    jammerActive = false;
+}
+
+void hopChannel() {
+    if (!jammerActive) return;
+
+    // Determine next channel based on mode
+    if (currentWiFiChannel == ALL_CHANNELS_MODE) {
+        // Sweep through all WiFi channels (1-83 covers Ch 1-13)
+        currentNRFChannel++;
+        if (currentNRFChannel > 83) {
+            currentNRFChannel = 1;
+        }
+    } else {
+        // Sweep within specific WiFi channel
+        currentNRFChannel++;
+        if (currentNRFChannel > WIFI_CH_END[currentWiFiChannel - 1]) {
+            currentNRFChannel = WIFI_CH_START[currentWiFiChannel - 1];
+        }
+    }
+
+    wlanSetChannel(currentNRFChannel);
+}
+
+void checkButtons() {
+    unsigned long currentTime = millis();
+
+    // UP = Toggle jammer
+    if (pcf.digitalRead(BTN_UP) == LOW && currentTime - lastButtonPressTime > debounceDelay) {
+        jammerToggleRequested = true;
+        lastButtonPressTime = currentTime;
+    }
+
+    // RIGHT = Next WiFi channel
+    if (pcf.digitalRead(BTN_RIGHT) == LOW && currentTime - lastButtonPressTime > debounceDelay) {
+        currentWiFiChannel++;
+        if (currentWiFiChannel > 13) currentWiFiChannel = ALL_CHANNELS_MODE;
+        if (jammerActive) {
+            // Reset to start of new channel range
+            if (currentWiFiChannel == ALL_CHANNELS_MODE) {
+                currentNRFChannel = 1;
+            } else {
+                currentNRFChannel = WIFI_CH_START[currentWiFiChannel - 1];
+            }
+        }
+        drawHeader();
+        drawChannelDisplay();
+        lastButtonPressTime = currentTime;
+    }
+
+    // LEFT = Previous WiFi channel
+    if (pcf.digitalRead(BTN_LEFT) == LOW && currentTime - lastButtonPressTime > debounceDelay) {
+        currentWiFiChannel--;
+        if (currentWiFiChannel < 0) currentWiFiChannel = 13;
+        if (jammerActive) {
+            if (currentWiFiChannel == ALL_CHANNELS_MODE) {
+                currentNRFChannel = 1;
+            } else {
+                currentNRFChannel = WIFI_CH_START[currentWiFiChannel - 1];
+            }
+        }
+        drawHeader();
+        drawChannelDisplay();
+        lastButtonPressTime = currentTime;
+    }
+
+    // SELECT = Exit (handled in main loop)
+}
+
+void wlanjammerSetup() {
+    tft.init();
+    tft.setRotation(2);
+    tft.fillScreen(TFT_BLACK);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SubGHz Cleanup - Release pin 16 and SPI bus before NRF24 init
+    // Pin 16 is shared: CC1101 GDO0/RX (with interrupt) AND NRF24 CE (GPIO output)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    const bool radioOk = Scanner::radioInitAndProbe();
+    (void)radioOk;
+    setupTouchscreen();
+
+    // Initialize radio pins
+    pinMode(WLAN_CE, OUTPUT);
+    pinMode(WLAN_CSN, OUTPUT);
+
+    // Initialize PCF buttons
+    pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+    pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+    pcf.pinMode(BTN_UP, INPUT_PULLUP);
+    pcf.pinMode(BTN_SELECT, INPUT_PULLUP);
+
+    jammerActive = false;
+    currentWiFiChannel = ALL_CHANNELS_MODE;
+    currentNRFChannel = 0;
+
+    // Initialize signal history
+    for (int ch = 0; ch < 13; ch++) {
+        signalLevels[ch] = 0;
+        for (int h = 0; h < 5; h++) {
+            signalHistory[ch][h] = 0;
+        }
+    }
+    historyIndex = 0;
+
+    float voltage = readBatteryVoltage();
+    drawStatusBar(voltage, false);
+
+    drawHeader();
+    drawButtonGuide();
+    drawChannelDisplay();
+    drawSpectrumBar();
+
+    pinMode(WLAN_CE, OUTPUT);
+    pinMode(WLAN_CSN, OUTPUT);
+    wlanDisable();
+
+    // Check if responding
+    byte status = Scanner::getRegister(0x07);
+
+    if (status != 0x00 && status != 0xFF) {
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setCursor(60, 150);
+        tft.print("Scanning signals...");
+        scanSignals();
+        drawSignalBars();
+    } else {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setCursor(60, 150);
+        tft.print("Radio not found!");
+    }
+
+    lastDisplayTime = millis();
+    lastScanTime = millis();
+}
+
+void wlanjammerLoop() {
+    // Check for exit
+    if (pcf.digitalRead(BTN_SELECT) == LOW) {
+        if (jammerActive) {
+            stopJamming();
+        }
+        feature_exit_requested = true;
+        // Reinitialize touch SPI before exiting - NRF24 reconfigured SPI bus
+        setupTouchscreen();
+        delay(200);
+        return;
+    }
+
+    checkButtons();
+
+    // Handle jammer toggle
+    if (jammerToggleRequested) {
+        jammerToggleRequested = false;
+        if (jammerActive) {
+            stopJamming();
+        } else {
+            startJamming();
+        }
+        drawHeader();
+        drawChannelDisplay();
+    }
+
+    // Rapid channel hopping when active
+    if (jammerActive) {
+        if (micros() - lastHopTime >= HOP_DELAY_US) {
+            hopChannel();
+            lastHopTime = micros();
+        }
+    }
+
+    // Periodic signal scan to verify jamming effectiveness
+    if (millis() - lastScanTime >= SCAN_INTERVAL_MS) {
+        scanSignals();
+        bool any = false;
+        for (int i = 0; i < 13; i++) {
+          if (signalLevels[i] > 0) { any = true; break; }
+        }
+        if (!any) {
+          Scanner::radioInitAndProbe(5);
+        }
+        drawSignalBars();
+    }
+
+    // Update display at ~10 FPS
+    if (millis() - lastDisplayTime >= 100) {
+        drawSpectrumBar();
+        lastDisplayTime = millis();
+    }
+}
+
+}  // namespace WLANJammer
+
+
+/*
+ *
+ * ProtoKill
+ * 
+ * 
+*/
+
 
 namespace ProtoKill {
 
@@ -2419,6 +3568,9 @@ void checkModeChange() {
 }
 
 void prokillSetup() {
+    tft.init();
+    tft.setRotation(2);
+
 
   tft.fillScreen(TFT_BLACK);
 

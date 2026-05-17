@@ -68,9 +68,11 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Rubber Ducky",
     "Back to Main Menu"};
 
-const int nrf_NUM_SUBMENU_ITEMS = 3;
+const int nrf_NUM_SUBMENU_ITEMS = 5;
 const char *nrf_submenu_items[nrf_NUM_SUBMENU_ITEMS] = {
     "Scanner",
+    "Spectrum Analyzer",
+    "WLAN Jammer",
     "Proto Kill",
     "Back to Main Menu"};
 
@@ -167,6 +169,8 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
 
 const unsigned char *nrf_submenu_icons[nrf_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_scanner,
+    bitmap_icon_analyzer,
+    bitmap_icon_wifi_jammer,
     bitmap_icon_kill,
     bitmap_icon_go_back
 };
@@ -1593,25 +1597,61 @@ void handleNRFSubmenuButtons() {
         last_interaction_time = millis();
         delay(200);
 
-        if (current_submenu_index == 2) {
+        if (current_submenu_index == 4) { 
             in_sub_menu = false;
             feature_active = false;
-            feature_exit_requested = false;
-            displayMenu();
-            handleButtons();
-            is_main_menu = false;
+            feature_exit_requested = false; 
+            displayMenu();  
+            handleButtons(); 
+            is_main_menu = false;           
         }
 
         if (current_submenu_index == 0) {
             current_submenu_index = 0;
             in_sub_menu = true;
             feature_active = true;
-            feature_exit_requested = false;
-            Scanner::scannerSetup();
-            while (current_submenu_index == 0 && !feature_exit_requested) {
+            feature_exit_requested = false; 
+            Scanner::scannerSetup(); 
+            while (current_submenu_index == 0 && !feature_exit_requested) {  
                 current_submenu_index = 0;
                 in_sub_menu = true;
-                Scanner::scannerLoop();
+                Scanner::scannerLoop();        
+                if (isButtonPressed(BTN_SELECT)) {
+                    in_sub_menu = true;
+                    is_main_menu = false; 
+                    submenu_initialized = false;
+                    feature_active = false;
+                    feature_exit_requested = false; 
+                    displaySubmenu(); 
+                    delay(200);            
+                    while (isButtonPressed(BTN_SELECT)) {
+                        delay(10); yield();
+                    }           
+                    break;  
+                }
+            }
+            if (feature_exit_requested) {
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
+            }
+        }
+
+        // Spectrum Analyzer (index 1)
+        if (current_submenu_index == 1) {
+            current_submenu_index = 1;
+            in_sub_menu = true;
+            feature_active = true;
+            feature_exit_requested = false;
+            Analyzer::analyzerSetup();
+            while (current_submenu_index == 1 && !feature_exit_requested) {
+                current_submenu_index = 1;
+                in_sub_menu = true;
+                Analyzer::analyzerLoop();
                 if (isButtonPressed(BTN_SELECT)) {
                     in_sub_menu = true;
                     is_main_menu = false;
@@ -1621,6 +1661,7 @@ void handleNRFSubmenuButtons() {
                     displaySubmenu();
                     delay(200);
                     while (isButtonPressed(BTN_SELECT)) {
+                        delay(10); yield();
                     }
                     break;
                 }
@@ -1636,16 +1677,17 @@ void handleNRFSubmenuButtons() {
             }
         }
 
-        if (current_submenu_index == 1) {
-            current_submenu_index = 1;
+        // WLAN Jammer (index 2)
+        if (current_submenu_index == 2) {
+            current_submenu_index = 2;
             in_sub_menu = true;
             feature_active = true;
             feature_exit_requested = false;
-            ProtoKill::prokillSetup();
-            while (current_submenu_index == 1 && !feature_exit_requested) {
-                current_submenu_index = 1;
+            WLANJammer::wlanjammerSetup();
+            while (current_submenu_index == 2 && !feature_exit_requested) {
+                current_submenu_index = 2;
                 in_sub_menu = true;
-                ProtoKill::prokillLoop();
+                WLANJammer::wlanjammerLoop();
                 if (isButtonPressed(BTN_SELECT)) {
                     in_sub_menu = true;
                     is_main_menu = false;
@@ -1655,6 +1697,7 @@ void handleNRFSubmenuButtons() {
                     displaySubmenu();
                     delay(200);
                     while (isButtonPressed(BTN_SELECT)) {
+                        delay(10); yield();
                     }
                     break;
                 }
@@ -1666,16 +1709,51 @@ void handleNRFSubmenuButtons() {
                 feature_active = false;
                 feature_exit_requested = false;
                 displaySubmenu();
+                delay(200);
+            }
+        }
+
+        if (current_submenu_index == 3) {
+            current_submenu_index = 3;
+            in_sub_menu = true;
+            feature_active = true;
+            feature_exit_requested = false;
+            ProtoKill::prokillSetup(); 
+            while (current_submenu_index == 3 && !feature_exit_requested) {  
+                current_submenu_index = 3;
+                in_sub_menu = true;
+                ProtoKill::prokillLoop();        
+                if (isButtonPressed(BTN_SELECT)) {
+                    in_sub_menu = true;
+                    is_main_menu = false; 
+                    submenu_initialized = false;
+                    feature_active = false;
+                    feature_exit_requested = false; 
+                    displaySubmenu(); 
+                    delay(200);            
+                    while (isButtonPressed(BTN_SELECT)) {
+                        delay(10); yield();
+                    }           
+                    break;  
+                }
+            }
+            if (feature_exit_requested) {
+                in_sub_menu = true;
+                is_main_menu = false; 
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false; 
+                displaySubmenu(); 
                 delay(200);
             }
         }
     }
 
     if (ts.touched() && !feature_active) {
-        TS_Point p = ts.getPoint();
         delay(10);
 
         int x, y; if (!readTouchXY(x, y)) { return; }
+
         for (int i = 0; i < active_submenu_size; i++) {
             int yPos = 30 + i * 30;
             if (i == active_submenu_size - 1) yPos += 10;
@@ -1691,34 +1769,35 @@ void handleNRFSubmenuButtons() {
                 displaySubmenu();
                 delay(200);
 
-                if (current_submenu_index == 2) {
+                if (current_submenu_index == 4) {
                     in_sub_menu = false;
                     feature_active = false;
-                    feature_exit_requested = false;
-                    displayMenu();
-                    handleButtons();
-                    is_main_menu = false;
+                    feature_exit_requested = false; 
+                    displayMenu();  
+                    handleButtons(); 
+                    is_main_menu = false;           
                 } else if (current_submenu_index == 0) {
                     current_submenu_index = 0;
                     in_sub_menu = true;
                     feature_active = true;
-                    feature_exit_requested = false;
-                    Scanner::scannerSetup();
-                    while (current_submenu_index == 0 && !feature_exit_requested) {
+                    feature_exit_requested = false; 
+                    Scanner::scannerSetup(); 
+                    while (current_submenu_index == 0 && !feature_exit_requested) {  
                         current_submenu_index = 0;
                         in_sub_menu = true;
-                        Scanner::scannerLoop();
+                        Scanner::scannerLoop();        
                         if (isButtonPressed(BTN_SELECT)) {
                             in_sub_menu = true;
-                            is_main_menu = false;
+                            is_main_menu = false; 
                             submenu_initialized = false;
                             feature_active = false;
-                            feature_exit_requested = false;
-                            displaySubmenu();
-                            delay(200);
+                            feature_exit_requested = false; 
+                            displaySubmenu(); 
+                            delay(200);            
                             while (isButtonPressed(BTN_SELECT)) {
-                            }
-                            break;
+                                delay(10); yield();
+                    }           
+                            break;  
                         }
                     }
                     if (feature_exit_requested) {
@@ -1731,13 +1810,81 @@ void handleNRFSubmenuButtons() {
                         delay(200);
                     }
                 } else if (current_submenu_index == 1) {
+                    // Touch: Spectrum Analyzer
                     current_submenu_index = 1;
                     in_sub_menu = true;
                     feature_active = true;
                     feature_exit_requested = false;
-                    ProtoKill::prokillSetup();
+                    Analyzer::analyzerSetup();
                     while (current_submenu_index == 1 && !feature_exit_requested) {
                         current_submenu_index = 1;
+                        in_sub_menu = true;
+                        Analyzer::analyzerLoop();
+                        if (isButtonPressed(BTN_SELECT)) {
+                            in_sub_menu = true;
+                            is_main_menu = false;
+                            submenu_initialized = false;
+                            feature_active = false;
+                            feature_exit_requested = false;
+                            displaySubmenu();
+                            delay(200);
+                            while (isButtonPressed(BTN_SELECT)) {
+                                delay(10); yield();
+                    }
+                            break;
+                        }
+                    }
+                    if (feature_exit_requested) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                    }
+                } else if (current_submenu_index == 2) {
+                    // Touch: WLAN Jammer
+                    current_submenu_index = 2;
+                    in_sub_menu = true;
+                    feature_active = true;
+                    feature_exit_requested = false;
+                    WLANJammer::wlanjammerSetup();
+                    while (current_submenu_index == 2 && !feature_exit_requested) {
+                        current_submenu_index = 2;
+                        in_sub_menu = true;
+                        WLANJammer::wlanjammerLoop();
+                        if (isButtonPressed(BTN_SELECT)) {
+                            in_sub_menu = true;
+                            is_main_menu = false;
+                            submenu_initialized = false;
+                            feature_active = false;
+                            feature_exit_requested = false;
+                            displaySubmenu();
+                            delay(200);
+                            while (isButtonPressed(BTN_SELECT)) {
+                                delay(10); yield();
+                    }
+                            break;
+                        }
+                    }
+                    if (feature_exit_requested) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                    }
+                } else if (current_submenu_index == 3) {
+                    current_submenu_index = 3;
+                    in_sub_menu = true;
+                    feature_active = true;
+                    feature_exit_requested = false;
+                    ProtoKill::prokillSetup();
+                    while (current_submenu_index == 3 && !feature_exit_requested) {
+                        current_submenu_index = 3;
                         in_sub_menu = true;
                         ProtoKill::prokillLoop();
                         if (isButtonPressed(BTN_SELECT)) {
@@ -1749,7 +1896,8 @@ void handleNRFSubmenuButtons() {
                             displaySubmenu();
                             delay(200);
                             while (isButtonPressed(BTN_SELECT)) {
-                            }
+                                delay(10); yield();
+                    }
                             break;
                         }
                     }
@@ -1768,6 +1916,7 @@ void handleNRFSubmenuButtons() {
         }
     }
 }
+
 
 void handleSubGHzSubmenuButtons() {
     if (isButtonPressed(BTN_UP)) {
