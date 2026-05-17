@@ -1999,17 +1999,6 @@ void bleScanSetup() {
 
   ensureBleInit();
   quiesceBleScan();
-  bgPauseReq = true;
-  if (bgScanActive && bleScan) {
-    bleScan->stop();
-  }
-  {
-    uint32_t t0 = millis();
-    while (bgScanActive && (millis() - t0) < 1500) {
-      delay(10);
-      yield();
-    }
-  }
 
   // Do not reuse cached BLE results across tool transitions:
   // stale result objects can trigger heap-heavy copies in getDevice().
@@ -2063,7 +2052,6 @@ void exit() {
   if (isScanning) isScanning = false;
   quiesceBleScan();
   bgHasResults = false;
-  bgPauseReq = false;
 }
 }
 
@@ -3516,17 +3504,6 @@ void bleScanSetup() {
   // Cross-tool transition hardening:
   // ensure no residual scanner session is still active before Tag2 starts.
   quiesceBleScan();
-  bgPauseReq = true;
-  if (bgScanActive && bleScan) {
-    bleScan->stop();
-  }
-  {
-    uint32_t t0 = millis();
-    while (bgScanActive && (millis() - t0) < 1500) {
-      delay(10);
-      yield();
-    }
-  }
   // Do not reuse cached BLE results across tool transitions:
   // force a fresh scan to avoid stale/fragmented result copies.
   bgHasResults = false;
@@ -3582,7 +3559,6 @@ void exit() {
   if (isScanning) isScanning = false;
   quiesceBleScan();
   bgHasResults = false;
-  bgPauseReq = false;
 }
 }
 
