@@ -6,7 +6,6 @@
 
 static AppSettings g_settings;
 AppSettings& settings() { return g_settings; }
-
 static const AccentOption kAccentPresets[] = {
   {"Orange", 0xFBE4},
   {"Green",  0x07E0},
@@ -28,6 +27,11 @@ uint16_t accentColor565(uint8_t preset) {
 
 const char* accentPresetName(uint8_t preset) {
   return kAccentPresets[accentPresetClamp(preset)].name;
+}
+
+static uint16_t normalizeSleepSeconds(uint16_t v) {
+  if (v == 15 || v == 30 || v == 60 || v == 120 || v == 300 || v == 600) return v;
+  return 0;
 }
 
 const char* settingsBoardProfileId() {
@@ -115,6 +119,12 @@ bool settingsLoad() {
   s.theme           = (Theme)(uint8_t)(doc["theme"] | (uint8_t)s.theme);
   s.accentColor     = accentPresetClamp(doc["accentColor"] | s.accentColor);
   s.neopixelEnabled = doc["neopixelEnabled"] | s.neopixelEnabled;
+  uint8_t sleepVal = (uint8_t)(doc["sleepSeconds"] | s.sleepSeconds);
+  if (!doc.containsKey("sleepSeconds")) {
+    // Backward compatibility with previous key name.
+    sleepVal = (uint8_t)(doc["sleepMinutes"] | sleepVal);
+  }
+  s.sleepSeconds    = normalizeSleepSeconds(sleepVal);
 
   s.autoWifiScan    = doc["autoWifiScan"]    | s.autoWifiScan;
   s.autoBleScan     = doc["autoBleScan"]     | s.autoBleScan;
@@ -160,6 +170,7 @@ bool settingsSave() {
   doc["theme"]           = (uint8_t)s.theme;
   doc["accentColor"]     = s.accentColor;
   doc["neopixelEnabled"] = s.neopixelEnabled;
+  doc["sleepSeconds"]    = normalizeSleepSeconds(s.sleepSeconds);
 
   doc["autoWifiScan"]    = s.autoWifiScan;
   doc["autoBleScan"]     = s.autoBleScan;

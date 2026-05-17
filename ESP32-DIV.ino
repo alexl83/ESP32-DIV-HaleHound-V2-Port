@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_sleep.h>
 #include <PCF8574.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
@@ -16,9 +17,195 @@
 TFT_eSPI tft = TFT_eSPI();
 
 PCF8574 pcf(PCF8574_I2C_ADDR);
+static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+static bool g_pixels_init = false;
+extern unsigned long last_interaction_time;
+
+static uint32_t sleepTimeoutMsFromSettings() {
+  uint16_t s = settings().sleepSeconds;
+  if (s == 15 || s == 30 || s == 60 || s == 120 || s == 300 || s == 600) return (uint32_t)s * 1000UL;
+  return 0;
+}
+
+static void pixelsEnsureInit() {
+  if (g_pixels_init) return;
+  g_pixels.begin();
+  g_pixels.setBrightness(NEOPIXEL_BRIGHT_MAX);
+  g_pixels.clear();
+  g_pixels.show();
+  g_pixels_init = true;
+}
+
+static void pixelsFill(uint8_t r, uint8_t g, uint8_t b) {
+  pixelsEnsureInit();
+  for (uint16_t i = 0; i < NEOPIXEL_COUNT; ++i) {
+    g_pixels.setPixelColor(i, g_pixels.Color(r, g, b));
+  }
+  g_pixels.show();
+}
+
+static void pixelsBootAnim() {
+  if (!settings().neopixelEnabled) return;
+  pixelsEnsureInit();
+  g_pixels.clear();
+  g_pixels.show();
+  for (uint16_t i = 0; i < NEOPIXEL_COUNT; ++i) {
+    g_pixels.setPixelColor(i, g_pixels.Color(0, 18, 0));
+    g_pixels.show();
+    delay(45);
+  }
+  delay(80);
+}
+
+static void pixelsUpdateState() {
+  static uint32_t lastMs = 0;
+  static int8_t kittDir = 1;
+  static int8_t kittPos = 0;
+  static uint8_t pr = 0, pg = 0, pb = 0;
+  static bool pixelsLit = false;
+
+  if (!settings().neopixelEnabled) {
+    if (pixelsLit) {
+      pixelsFill(0, 0, 0);
+      pr = pg = pb = 0;
+      pixelsLit = false;
+    }
+    return;
+  }
+
+  // Tie pixels to configurable sleep timeout: off when idle for too long.
+  const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
+  const uint32_t nowIdle = millis();
+  if (idleTimeoutMs > 0 && last_interaction_time > 0 &&
+      (nowIdle - last_interaction_time) > idleTimeoutMs) {
+    if (pixelsLit) {
+      pixelsFill(0, 0, 0);
+      pr = pg = pb = 0;
+      pixelsLit = false;
+    }
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastMs < 198) return;
+  lastMs = now;
+
+  uint8_t r = 0, g = 0, b = 0;
+  if (feature_active) {
+    r = 28; g = 8; b = 0;        // active feature: warm orange
+  } else if (in_sub_menu) {
+    r = 0; g = 0; b = 26;        // submenu: blue
+  } else {
+    // main menu idle: Knight Rider-style orange scanner.
+    pixelsEnsureInit();
+    g_pixels.clear();
+    for (int i = 0; i < (int)NEOPIXEL_COUNT; ++i) {
+      int d = abs(i - kittPos);
+      uint8_t lv = (d == 0) ? 56 : (d == 1) ? 18 : 4;
+      g_pixels.setPixelColor(i, g_pixels.Color(lv, 0, 0));
+    }
+    g_pixels.show();
+
+    kittPos += kittDir;
+    if (kittPos >= (int)NEOPIXEL_COUNT - 1) {
+      kittPos = (int)NEOPIXEL_COUNT - 1;
+      kittDir = -1;
+    } else if (kittPos <= 0) {
+      kittPos = 0;
+      kittDir = 1;
+    }
+    pr = pg = pb = 0;
+    pixelsLit = true;
+    return;
+  }
+
+  if (r != pr || g != pg || b != pb) {
+    pixelsFill(r, g, b);
+    pr = r; pg = g; pb = b;
+    pixelsLit = (r || g || b);
+  }
+}
 
 void setBrightness(uint8_t value) {
   ledcWrite(PWM_CHANNEL, value);
+}
+
+static void forceBacklightOff() {
+  ledcDetachPin(BACKLIGHT_PIN);
+  pinMode(BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(BACKLIGHT_PIN, LOW);
+}
+
+static void restoreBacklightPwm(uint8_t value) {
+  ledcAttachPin(BACKLIGHT_PIN, PWM_CHANNEL);
+  ledcWrite(PWM_CHANNEL, value);
+}
+
+static void serviceDisplaySleep() {
+  static bool sleeping = false;
+  static bool tftSlept = false;
+  static bool blForcedOff = false;
+  static uint32_t lastSeenInteraction = 0;
+  const uint32_t now = millis();
+  const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
+  const uint32_t lastInt = last_interaction_time;
+
+  if (lastInt != lastSeenInteraction) {
+    lastSeenInteraction = lastInt;
+    if (sleeping) {
+      if (tftSlept) {
+        tft.writecommand(0x11); // SLPOUT
+        delay(120);
+        tft.writecommand(0x29); // DISPON
+        tftSlept = false;
+      }
+      if (blForcedOff) {
+        restoreBacklightPwm(settings().brightness);
+        blForcedOff = false;
+      } else {
+        setBrightness(settings().brightness);
+      }
+      sleeping = false;
+      displayMenu();
+    }
+  }
+
+  if (idleTimeoutMs == 0) {
+    if (sleeping) {
+      if (tftSlept) {
+        tft.writecommand(0x11); // SLPOUT
+        delay(120);
+        tft.writecommand(0x29); // DISPON
+        tftSlept = false;
+      }
+      if (blForcedOff) {
+        restoreBacklightPwm(settings().brightness);
+        blForcedOff = false;
+      } else {
+        setBrightness(settings().brightness);
+      }
+      sleeping = false;
+      displayMenu();
+    }
+    return;
+  }
+
+  if (!sleeping && lastInt > 0 && (now - lastInt) > idleTimeoutMs) {
+    tft.writecommand(0x28); // DISPOFF
+    delay(10);
+    tft.writecommand(0x10); // SLPIN
+    delay(5);
+    tftSlept = true;
+    forceBacklightOff();
+    blForcedOff = true;
+    sleeping = true;
+  }
+
+  if (sleeping) {
+    // Keep MCU in light sleep while inactive, waking periodically to poll inputs.
+    esp_sleep_enable_timer_wakeup(200000); // 200 ms
+    esp_light_sleep_start();
+  }
 }
 
 bool feature_exit_requested = false;
@@ -3490,5 +3677,7 @@ void setup() {
 void loop() {
   applyThemeToPalette(settings().theme);
   handleButtons();
+  serviceDisplaySleep();
+  pixelsUpdateState();
   updateStatusBar();
 }
