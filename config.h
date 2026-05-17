@@ -70,6 +70,11 @@ namespace BleScan {
   // Last known BLE device count from background/foreground scans.
   int  getLastCount();
 }
+namespace BleTag2 {
+  void bleScanSetup();
+  void bleScanLoop();
+  void exit();
+}
 namespace Scanner {
   void scannerSetup();
   void scannerLoop();
