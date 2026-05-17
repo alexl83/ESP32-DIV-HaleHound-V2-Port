@@ -1511,6 +1511,8 @@ static void drawTabBar(const char* leftButton, bool leftDisabled,
 
 static TaskHandle_t bgBleScanTaskHandle = nullptr;
 static volatile bool bgHasResults = false;
+static volatile bool bgPauseReq = false;
+static volatile bool bgScanActive = false;
 static volatile uint32_t bgLastScanMs = 0;
 static volatile bool bgBleScanRunning = false;
 static volatile bool fgBleScanInProgress = false;
@@ -1526,6 +1528,19 @@ static void stopBgBleScanIfRunning() {
   bgBleScanRunning = false;
 }
 
+static void quiesceBleScan() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (adv) {
+    adv->stop();
+    delay(30);
+  }
+  if (!bleScan) return;
+  bleScan->stop();
+  delay(30);
+  bleScan->clearResults();
+  delay(10);
+}
+
 static void ensureBleInit() {
   if (bleInitDone) return;
 
@@ -1537,6 +1552,12 @@ static void ensureBleInit() {
 static void bgBleScanTask(void* ) {
   ensureBleInit();
   for (;;) {
+    if (bgPauseReq) {
+      if (bleScan) bleScan->stop();
+      bgScanActive = false;
+      vTaskDelay(120 / portTICK_PERIOD_MS);
+      continue;
+    }
     const uint32_t now = millis();
     if (bgBootMs == 0) bgBootMs = now;
 
@@ -1548,7 +1569,10 @@ static void bgBleScanTask(void* ) {
       }
       bgBleScanRunning = true;
       isScanning = true;
+      bgScanActive = true;
+      bleScan->clearResults();
       bleResults = bleScan->start(2, false);
+      bgScanActive = false;
       isScanning = false;
       bgBleScanRunning = false;
       if (bleResults.getCount() >= 0) {
@@ -1603,6 +1627,7 @@ void startBLEScan() {
   fullScreenUpdate = true;
   ensureBleInit();
   fgBleScanInProgress = true;
+  bleScan->clearResults();
   bleResults = bleScan->start(5, false);
   fgBleScanInProgress = false;
   isScanning = false;
@@ -1973,21 +1998,23 @@ void bleScanSetup() {
 #endif
 
   ensureBleInit();
-
-  // With auto BLE scan off, cached bleResults are not updated — only reuse when background scan is on.
-  if (settings().autoBleScan && bgHasResults && bleResults.getCount() > 0) {
-    current_page = 0;
-    currentIndex = 0;
-    listStartIndex = 0;
-    isDetailView = false;
-    screenNeedsUpdate = true;
-    fullScreenUpdate = true;
-    updateBLEList();
-  } else {
-    startBLEScan();
+  quiesceBleScan();
+  bgPauseReq = true;
+  if (bgScanActive && bleScan) {
+    bleScan->stop();
+  }
+  {
+    uint32_t t0 = millis();
+    while (bgScanActive && (millis() - t0) < 1500) {
+      delay(10);
+      yield();
+    }
   }
 
-  redrawTouchButtonBar();
+  // Do not reuse cached BLE results across tool transitions:
+  // stale result objects can trigger heap-heavy copies in getDevice().
+  bgHasResults = false;
+  startBLEScan();
 }
 
 void bleScanLoop() {
@@ -2017,16 +2044,9 @@ void bleScanLoop() {
 }
 
 void startBackgroundScanner() {
-  if (bgBleScanTaskHandle != nullptr) return;
-  xTaskCreatePinnedToCore(
-    bgBleScanTask,
-    "bgBleScan",
-    4096,
-    nullptr,
-    1,
-    &bgBleScanTaskHandle,
-    0
-  );
+  // Disabled for stability on ESP32-DIV V2:
+  // concurrent background scans caused cross-tool BLE reboots.
+  bgBleScanTaskHandle = nullptr;
 }
 
 int getLastCount() {
@@ -2040,10 +2060,10 @@ void exit() {
   if (bgBleScanRunning) {
     stopBgBleScanIfRunning();
   }
-  if (isScanning && bleScan) {
-    bleScan->stop();
-    isScanning = false;
-  }
+  if (isScanning) isScanning = false;
+  quiesceBleScan();
+  bgHasResults = false;
+  bgPauseReq = false;
 }
 }
 
@@ -2176,11 +2196,26 @@ static void drawTabBar(const char* leftButton, bool leftDisabled,
 
 static TaskHandle_t bgBleScanTaskHandle = nullptr;
 static volatile bool bgHasResults = false;
+static volatile bool bgPauseReq = false;
+static volatile bool bgScanActive = false;
 static volatile uint32_t bgLastScanMs = 0;
 static const uint32_t BG_BLE_SCAN_INTERVAL_MS = 15000;
 static bool bleInitDone = false;
 static const uint32_t BG_BOOT_GRACE_MS = 6000;
 static uint32_t bgBootMs = 0;
+
+static void quiesceBleScan() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (adv) {
+    adv->stop();
+    delay(30);
+  }
+  if (!bleScan) return;
+  bleScan->stop();
+  delay(30);
+  bleScan->clearResults();
+  delay(10);
+}
 static std::vector<int> tag2Indices;
 static std::vector<Tag2Profile> loadedProfileList;
 static bool showingLoadedProfiles = false;
@@ -2200,18 +2235,14 @@ static bool parseTag2Payload(BLEAdvertisedDevice& device, uint8_t out[10]) {
 static void rebuildTag2Index() {
   tag2Indices.clear();
   const int total = bleResults.getCount();
-  for (int i = 0; i < total; i++) {
+  const int cap = min(total, 96);  // avoid heap spikes on huge result sets
+  for (int i = 0; i < cap; i++) {
     BLEAdvertisedDevice d = bleResults.getDevice(i);
     uint8_t p[10];
     if (parseTag2Payload(d, p)) {
       tag2Indices.push_back(i);
     }
   }
-  std::sort(tag2Indices.begin(), tag2Indices.end(), [](int a, int b) {
-    BLEAdvertisedDevice da = bleResults.getDevice(a);
-    BLEAdvertisedDevice db = bleResults.getDevice(b);
-    return da.getRSSI() > db.getRSSI();
-  });
 }
 
 static int filteredCount() {
@@ -2807,15 +2838,23 @@ void displayScanning() {
 static void bgBleScanTask(void* ) {
   ensureBleInit();
   for (;;) {
+    if (bgPauseReq) {
+      if (bleScan) bleScan->stop();
+      bgScanActive = false;
+      vTaskDelay(120 / portTICK_PERIOD_MS);
+      continue;
+    }
     const uint32_t now = millis();
     if (bgBootMs == 0) bgBootMs = now;
 
     const bool idleOk = (now - bgBootMs) > BG_BOOT_GRACE_MS;
     if (settings().autoBleScan && idleOk && !feature_active && !in_sub_menu) {
       isScanning = true;
-
+      bgScanActive = true;
+      bleScan->clearResults();
       bleResults = bleScan->start(2, false);
       rebuildTag2Index();
+      bgScanActive = false;
       isScanning = false;
       if (bleResults.getCount() >= 0) {
         bgHasResults = (filteredCount() > 0);
@@ -2845,6 +2884,7 @@ void startBLEScan() {
   headerIconsDirty = true;
   ensureBleInit();
   isScanning = true;
+  bleScan->clearResults();
   bleResults = bleScan->start(5, false);
   rebuildTag2Index();
   cacheProfilesFromCurrentResults();
@@ -3473,19 +3513,24 @@ void bleScanSetup() {
   pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
 
   ensureBleInit();
-  rebuildTag2Index();
-
-  if (bgHasResults && filteredCount() > 0) {
-    current_page = 0;
-    currentIndex = 0;
-    listStartIndex = 0;
-    isDetailView = false;
-    screenNeedsUpdate = true;
-    fullScreenUpdate = true;
-    updateBLEList();
-  } else {
-    startBLEScan();
+  // Cross-tool transition hardening:
+  // ensure no residual scanner session is still active before Tag2 starts.
+  quiesceBleScan();
+  bgPauseReq = true;
+  if (bgScanActive && bleScan) {
+    bleScan->stop();
   }
+  {
+    uint32_t t0 = millis();
+    while (bgScanActive && (millis() - t0) < 1500) {
+      delay(10);
+      yield();
+    }
+  }
+  // Do not reuse cached BLE results across tool transitions:
+  // force a fresh scan to avoid stale/fragmented result copies.
+  bgHasResults = false;
+  startBLEScan();
 }
 
 void bleScanLoop() {
@@ -3518,16 +3563,9 @@ void bleScanLoop() {
 }
 
 void startBackgroundScanner() {
-  if (bgBleScanTaskHandle != nullptr) return;
-  xTaskCreatePinnedToCore(
-    bgBleScanTask,
-    "bgBleScan",
-    4096,
-    nullptr,
-    1,
-    &bgBleScanTaskHandle,
-    0
-  );
+  // Disabled for stability on ESP32-DIV V2:
+  // concurrent background scans caused cross-tool BLE reboots.
+  bgBleScanTaskHandle = nullptr;
 }
 
 int getLastCount() {
@@ -3541,10 +3579,10 @@ void exit() {
   stopLiveScan();
   if (tag2Adv) tag2Adv->stop();
   advEnabled = false;
-  if (isScanning && bleScan) {
-    bleScan->stop();
-    isScanning = false;
-  }
+  if (isScanning) isScanning = false;
+  quiesceBleScan();
+  bgHasResults = false;
+  bgPauseReq = false;
 }
 }
 

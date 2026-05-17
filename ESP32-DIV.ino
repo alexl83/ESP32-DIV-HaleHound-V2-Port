@@ -155,6 +155,7 @@ static void serviceDisplaySleep() {
   const uint32_t now = millis();
   const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
   const uint32_t lastInt = last_interaction_time;
+  const bool toolActive = feature_active;
 
   if (lastInt != lastSeenInteraction) {
     lastSeenInteraction = lastInt;
@@ -171,6 +172,21 @@ static void serviceDisplaySleep() {
   }
 
   if (idleTimeoutMs == 0) {
+    if (sleeping) {
+      if (blForcedOff) {
+        restoreBacklightPwm(settings().brightness);
+        blForcedOff = false;
+      } else {
+        setBrightness(settings().brightness);
+      }
+      sleeping = false;
+      displayMenu();
+    }
+    return;
+  }
+
+  // Never enter light sleep while a tool is active; avoids radio/UI instability.
+  if (toolActive) {
     if (sleeping) {
       if (blForcedOff) {
         restoreBacklightPwm(settings().brightness);
@@ -1603,6 +1619,21 @@ void handleWiFiSubmenuButtons() {
 }
 
 void handleBluetoothSubmenuButtons() {
+    auto stabilizeBleTransition = []() {
+        BLEAdvertising* adv = BLEDevice::getAdvertising();
+        if (adv) {
+            adv->stop();
+            delay(60);
+        }
+        ::BLEScan* scan = BLEDevice::getScan();
+        if (scan) {
+            scan->stop();
+            delay(60);
+            scan->clearResults();
+        }
+        delay(320);
+        yield();
+    };
     if (isButtonPressed(BTN_UP)) {
         current_submenu_index = (current_submenu_index - 1 + active_submenu_size) % active_submenu_size;
         if (current_submenu_index < 0) {
@@ -1783,6 +1814,7 @@ void handleBluetoothSubmenuButtons() {
             in_sub_menu = true;
             feature_active = true;
             feature_exit_requested = false;
+            stabilizeBleTransition();
             BleScan::bleScanSetup();
             while (current_submenu_index == 4 && !feature_exit_requested) {
                 current_submenu_index = 4;
@@ -1803,6 +1835,7 @@ void handleBluetoothSubmenuButtons() {
             }
 
             BleScan::exit();
+            stabilizeBleTransition();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;
@@ -1819,6 +1852,7 @@ void handleBluetoothSubmenuButtons() {
             in_sub_menu = true;
             feature_active = true;
             feature_exit_requested = false;
+            stabilizeBleTransition();
             BleTag2::bleScanSetup();
             while (current_submenu_index == 5 && !feature_exit_requested) {
                 current_submenu_index = 5;
@@ -1839,6 +1873,7 @@ void handleBluetoothSubmenuButtons() {
             }
 
             BleTag2::exit();
+            stabilizeBleTransition();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;
@@ -2049,6 +2084,7 @@ void handleBluetoothSubmenuButtons() {
                     in_sub_menu = true;
                     feature_active = true;
                     feature_exit_requested = false;
+                    stabilizeBleTransition();
                     BleScan::bleScanSetup();
                     while (current_submenu_index == 4 && !feature_exit_requested) {
                         current_submenu_index = 4;
@@ -2068,6 +2104,7 @@ void handleBluetoothSubmenuButtons() {
                         }
                     }
                     BleScan::exit();
+                    stabilizeBleTransition();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
@@ -2082,6 +2119,7 @@ void handleBluetoothSubmenuButtons() {
                     in_sub_menu = true;
                     feature_active = true;
                     feature_exit_requested = false;
+                    stabilizeBleTransition();
                     BleTag2::bleScanSetup();
                     while (current_submenu_index == 5 && !feature_exit_requested) {
                         current_submenu_index = 5;
@@ -2101,6 +2139,7 @@ void handleBluetoothSubmenuButtons() {
                         }
                     }
                     BleTag2::exit();
+                    stabilizeBleTransition();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
