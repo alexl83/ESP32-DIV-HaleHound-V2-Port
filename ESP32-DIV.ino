@@ -1835,7 +1835,6 @@ void handleBluetoothSubmenuButtons() {
             }
 
             BleScan::exit();
-            stabilizeBleTransition();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;
@@ -1873,7 +1872,6 @@ void handleBluetoothSubmenuButtons() {
             }
 
             BleTag2::exit();
-            stabilizeBleTransition();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;
@@ -2104,7 +2102,6 @@ void handleBluetoothSubmenuButtons() {
                         }
                     }
                     BleScan::exit();
-                    stabilizeBleTransition();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
@@ -2139,7 +2136,6 @@ void handleBluetoothSubmenuButtons() {
                         }
                     }
                     BleTag2::exit();
-                    stabilizeBleTransition();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
