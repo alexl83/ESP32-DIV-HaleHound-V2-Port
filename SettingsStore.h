@@ -14,6 +14,7 @@ struct AppSettings {
   uint8_t  accentColor = 0;
 
   bool     neopixelEnabled = false;
+  uint8_t  sleepSeconds    = 0;   // 0=Off, 15/30/60 supported
 
   bool     autoWifiScan    = true;
   bool     autoBleScan     = true;

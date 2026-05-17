@@ -1399,7 +1399,7 @@ static int  sel = 0;
 static bool dirtySettings = false;
 static bool uiDirty = false;
 
-static const char* items[] = {"Brightness", "Theme", "Accent", "NeoPixel", "Auto Scan"};
+static const char* items[] = {"Brightness", "Theme", "NeoPixel", "Auto Scan", "Sleep Time"};
 static const int N = sizeof(items)/sizeof(items[0]);
 
 static uint8_t  last_brightness;
@@ -1407,6 +1407,7 @@ static Theme    last_theme;
 static uint8_t  last_accent;
 static bool     last_neopixel;
 static bool     last_autoScan;
+static uint8_t  last_sleepSeconds;
 static int      last_sel;
 
 static bool dragging = false;
@@ -1642,8 +1643,34 @@ static void drawSwitchRow(bool on, bool selected, int row) {
   drawSwitchWidgetRow(on, selected, row);
 }
 
-static void drawNeoPixel(bool on, bool selected) { drawSwitchRow(on, selected, 3); }
-static void drawAutoScan(bool on, bool selected) { drawSwitchRow(on, selected, 4); }
+static void drawNeoPixel(bool on, bool selected) { drawSwitchRow(on, selected, 2); }
+static void drawAutoScan(bool on, bool selected) { drawSwitchRow(on, selected, 3); }
+static const char* sleepLabel(uint8_t m) {
+  switch (m) {
+    case 15: return "15s";
+    case 30: return "30s";
+    case 60: return "60s";
+    default: return "Off";
+  }
+}
+static void drawSleepWidget(uint8_t minutes, bool ) {
+  tft.startWrite();
+  wipeSwitchWidgetArea(4);
+  Rect r = rowRect(4);
+  setLabelFont();
+  const char* v = sleepLabel(minutes);
+  const int w = (int)tft.textWidth(v);
+  const int x = r.x + r.w - w - 10;
+  const int y = r.y + (r.h/2 - 6);
+  tft.setCursor(x, y);
+  tft.setTextColor(textStrong, UI_BG);
+  tft.print(v);
+  tft.endWrite();
+}
+static void drawSleep(uint8_t minutes, bool selected) {
+  drawCardStatic(4, selected);
+  drawSleepWidget(minutes, selected);
+}
 
 static Rect backRect(){
   int h = tft.height();
@@ -1709,7 +1736,8 @@ static void drawAll() {
   drawAccent(s.accentColor, sel==2);
   drawNeoPixel(s.neopixelEnabled, sel==3);
   bool autoScan = (s.autoWifiScan || s.autoBleScan);
-  drawAutoScan(autoScan, sel==4);
+  drawAutoScan(autoScan, sel==3);
+  drawSleep(s.sleepSeconds, sel==4);
 
   drawFooter(false, false);
 
@@ -1719,6 +1747,7 @@ static void drawAll() {
   last_accent     = s.accentColor;
   last_neopixel   = s.neopixelEnabled;
   last_autoScan     = autoScan;
+  last_sleepSeconds = s.sleepSeconds;
   uiDirty = false;
 }
 
@@ -1738,7 +1767,8 @@ static void redrawIfChanged() {
     drawCardStatic(2, sel==2);  drawAccentWidget(s.accentColor, sel==2);
     drawCardStatic(3, sel==3);  drawSwitchWidgetRow(s.neopixelEnabled, sel==3, 3);
     bool autoScan = (s.autoWifiScan || s.autoBleScan);
-    drawCardStatic(4, sel==4);  drawSwitchWidgetRow(autoScan, sel==4, 4);
+    drawCardStatic(3, sel==3);  drawSwitchWidgetRow(autoScan, sel==3, 3);
+    drawCardStatic(4, sel==4);  drawSleepWidget(s.sleepSeconds, sel==4);
     last_sel = sel;
   } else {
     if (s.brightness != last_brightness) {
@@ -1753,6 +1783,10 @@ static void redrawIfChanged() {
     if (autoScan != last_autoScan) {
       drawSwitchWidgetRow(autoScan, sel==4, 4);
       last_autoScan = autoScan;
+    }
+    if (s.sleepSeconds != last_sleepSeconds) {
+      drawSleepWidget(s.sleepSeconds, sel==4);
+      last_sleepSeconds = s.sleepSeconds;
     }
     if (s.theme != last_theme) {
       drawThemeWidget(s.theme, sel==1);
@@ -1816,6 +1850,34 @@ static bool applyAutoScan(bool en){
   uiDirty = true;
   lastChangeMs = millis();
   return true;
+}
+static uint8_t normalizeSleep(uint8_t v) {
+  if (v == 15 || v == 30 || v == 60) return v;
+  return 0;
+}
+static bool applySleepMinutes(uint8_t v){
+  auto& s = settings();
+  v = normalizeSleep(v);
+  if (s.sleepSeconds == v) return false;
+  s.sleepSeconds = v;
+  dirtySettings = true;
+  uiDirty = true;
+  lastChangeMs = millis();
+  return true;
+}
+static uint8_t nextSleepValue(uint8_t cur) {
+  cur = normalizeSleep(cur);
+  if (cur == 0) return 15;
+  if (cur == 15) return 30;
+  if (cur == 30) return 60;
+  return 0;
+}
+static uint8_t prevSleepValue(uint8_t cur) {
+  cur = normalizeSleep(cur);
+  if (cur == 0) return 60;
+  if (cur == 60) return 30;
+  if (cur == 30) return 15;
+  return 0;
 }
 
 static void handleTouch() {
@@ -1910,6 +1972,16 @@ static void handleTouch() {
         lastToggleMs = now;
       }
     }
+  } else if (sel == 4) {
+    Rect rr = rowRect(4);
+    int triggerX = rr.x + LABEL_W;
+    if (tx >= triggerX && tx <= rr.x + rr.w && ty >= rr.y && ty <= rr.y + rr.h) {
+      uint32_t now = millis();
+      if (now - lastToggleMs > 160) {
+        applySleepMinutes(nextSleepValue(s.sleepSeconds));
+        lastToggleMs = now;
+      }
+    }
   }
 }
 
@@ -1962,9 +2034,9 @@ void loop(){
     auto& s=settings();
     if (sel==0 && s.brightness>0)      { applyBrightness(s.brightness>8? s.brightness-8:0); }
     else if (sel==1)                   { applyTheme(Theme::Dark); }
-    else if (sel==2)                   { applyAccent((s.accentColor + ACCENT_PRESET_COUNT - 1) % ACCENT_PRESET_COUNT); }
-    else if (sel==3)                   { applyNeoPixel(false); }
-    else if (sel==4)                   { applyAutoScan(false); }
+    else if (sel==2)                   { applyNeoPixel(false); }
+    else if (sel==3)                   { applyAutoScan(false); }
+    else if (sel==4)                   { applySleepMinutes(prevSleepValue(s.sleepSeconds)); }
     changedByButtons=true;
     lastActionMs = now;
   }
@@ -1972,9 +2044,9 @@ void loop(){
     auto& s=settings();
     if (sel==0 && s.brightness<255)    { applyBrightness(s.brightness+8); }
     else if (sel==1)                   { applyTheme(Theme::Light); }
-    else if (sel==2)                   { applyAccent((s.accentColor + 1) % ACCENT_PRESET_COUNT); }
-    else if (sel==3)                   { applyNeoPixel(true); }
-    else if (sel==4)                   { applyAutoScan(true); }
+    else if (sel==2)                   { applyNeoPixel(true); }
+    else if (sel==3)                   { applyAutoScan(true); }
+    else if (sel==4)                   { applySleepMinutes(nextSleepValue(s.sleepSeconds)); }
     changedByButtons=true;
     lastActionMs = now;
   }
