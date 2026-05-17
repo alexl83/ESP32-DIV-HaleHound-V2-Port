@@ -2,6 +2,7 @@
 #include <PCF8574.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
+#include <Adafruit_NeoPixel.h>
 #include "SettingsStore.h"
 #include "Touchscreen.h"
 #include "config.h"
@@ -16,6 +17,90 @@
 TFT_eSPI tft = TFT_eSPI();
 
 PCF8574 pcf(pcf_ADDR);
+static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+static bool g_pixels_init = false;
+
+static void pixelsEnsureInit() {
+  if (g_pixels_init) return;
+  g_pixels.begin();
+  g_pixels.setBrightness(NEOPIXEL_BRIGHT_MAX);
+  g_pixels.clear();
+  g_pixels.show();
+  g_pixels_init = true;
+}
+
+static void pixelsFill(uint8_t r, uint8_t g, uint8_t b) {
+  pixelsEnsureInit();
+  for (uint16_t i = 0; i < NEOPIXEL_COUNT; ++i) {
+    g_pixels.setPixelColor(i, g_pixels.Color(r, g, b));
+  }
+  g_pixels.show();
+}
+
+static void pixelsBootAnim() {
+  if (!settings().neopixelEnabled) return;
+  pixelsEnsureInit();
+  g_pixels.clear();
+  g_pixels.show();
+  for (uint16_t i = 0; i < NEOPIXEL_COUNT; ++i) {
+    g_pixels.setPixelColor(i, g_pixels.Color(0, 18, 0));
+    g_pixels.show();
+    delay(45);
+  }
+  delay(80);
+}
+
+static void pixelsUpdateState() {
+  static uint32_t lastMs = 0;
+  static int8_t kittDir = 1;
+  static int8_t kittPos = 0;
+  static uint8_t pr = 0, pg = 0, pb = 0;
+
+  if (!settings().neopixelEnabled) {
+    if (pr || pg || pb) {
+      pixelsFill(0, 0, 0);
+      pr = pg = pb = 0;
+    }
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastMs < 198) return;
+  lastMs = now;
+
+  uint8_t r = 0, g = 0, b = 0;
+  if (feature_active) {
+    r = 28; g = 8; b = 0;        // active feature: warm orange
+  } else if (in_sub_menu) {
+    r = 0; g = 0; b = 26;        // submenu: blue
+  } else {
+    // main menu idle: Knight Rider-style orange scanner.
+    pixelsEnsureInit();
+    g_pixels.clear();
+    for (int i = 0; i < (int)NEOPIXEL_COUNT; ++i) {
+      int d = abs(i - kittPos);
+      uint8_t lv = (d == 0) ? 56 : (d == 1) ? 18 : 4;
+      g_pixels.setPixelColor(i, g_pixels.Color(lv, 0, 0));
+    }
+    g_pixels.show();
+
+    kittPos += kittDir;
+    if (kittPos >= (int)NEOPIXEL_COUNT - 1) {
+      kittPos = (int)NEOPIXEL_COUNT - 1;
+      kittDir = -1;
+    } else if (kittPos <= 0) {
+      kittPos = 0;
+      kittDir = 1;
+    }
+    pr = pg = pb = 0;
+    return;
+  }
+
+  if (r != pr || g != pg || b != pb) {
+    pixelsFill(r, g, b);
+    pr = r; pg = g; pb = b;
+  }
+}
 
 void setBrightness(uint8_t value) {
   ledcWrite(PWM_CHANNEL, value);
@@ -3413,6 +3498,7 @@ void setup() {
   settingsLoad();
   applyThemeToPalette(settings().theme);
   setBrightness(settings().brightness);
+  pixelsBootAnim();
 
   pcf.begin();
   pcf.pinMode(BTN_UP, INPUT_PULLUP);
@@ -3444,6 +3530,7 @@ void setup() {
 
 void loop() {
   applyThemeToPalette(settings().theme);
+  pixelsUpdateState();
   handleButtons();
   updateStatusBar();
 }
