@@ -19,6 +19,8 @@ TFT_eSPI tft = TFT_eSPI();
 PCF8574 pcf(pcf_ADDR);
 static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 static bool g_pixels_init = false;
+extern unsigned long last_interaction_time;
+static constexpr uint32_t kPixelIdleTimeoutMs = 30000;
 
 static void pixelsEnsureInit() {
   if (g_pixels_init) return;
@@ -55,11 +57,24 @@ static void pixelsUpdateState() {
   static int8_t kittDir = 1;
   static int8_t kittPos = 0;
   static uint8_t pr = 0, pg = 0, pb = 0;
+  static bool pixelsLit = false;
 
   if (!settings().neopixelEnabled) {
-    if (pr || pg || pb) {
+    if (pixelsLit) {
       pixelsFill(0, 0, 0);
       pr = pg = pb = 0;
+      pixelsLit = false;
+    }
+    return;
+  }
+
+  // Tie pixels to UI inactivity timeout: off when idle for too long.
+  const uint32_t nowIdle = millis();
+  if (last_interaction_time > 0 && (nowIdle - last_interaction_time) > kPixelIdleTimeoutMs) {
+    if (pixelsLit) {
+      pixelsFill(0, 0, 0);
+      pr = pg = pb = 0;
+      pixelsLit = false;
     }
     return;
   }
@@ -93,12 +108,14 @@ static void pixelsUpdateState() {
       kittDir = 1;
     }
     pr = pg = pb = 0;
+    pixelsLit = true;
     return;
   }
 
   if (r != pr || g != pg || b != pb) {
     pixelsFill(r, g, b);
     pr = r; pg = g; pb = b;
+    pixelsLit = (r || g || b);
   }
 }
 
