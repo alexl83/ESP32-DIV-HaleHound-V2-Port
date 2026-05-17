@@ -1449,9 +1449,10 @@ void updateDisplay() {
     tft.fillRect(0, 40, 240, 280, TFT_BLACK);
 
     if (sdTotalProfiles == 0) {
+        const bool sdNotMounted = (sdLastErr == "SD not mounted");
         tft.setCursor(10, 35 + yshift);
         tft.setTextColor(TFT_WHITE);
-        tft.print("No profiles on SD.");
+        tft.print(sdNotMounted ? "SD not mounted." : "No profiles on SD.");
         if (sdLastErr.length()) {
           tft.setCursor(10, 48 + yshift);
           tft.setTextColor(UI_DIM_TEXT);
@@ -1814,10 +1815,11 @@ void saveLoop() {
         }
     } else {
         if (!emptyUiDrawn) {
+            const bool sdNotMounted = (sdLastErr == "SD not mounted");
             tft.fillRect(0, 40, 240, 90, TFT_BLACK);
             tft.setCursor(10, 50 + yshift);
             tft.setTextColor(TFT_WHITE);
-            tft.print("No profiles on SD.");
+            tft.print(sdNotMounted ? "SD not mounted." : "No profiles on SD.");
             tft.setCursor(10, 66 + yshift);
             tft.setTextColor(TFT_CYAN);
             tft.print("Press any key to go back");
