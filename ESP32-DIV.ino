@@ -160,13 +160,14 @@ const char *submenu_items[NUM_SUBMENU_ITEMS] = {
     "Captive Portal",
     "Back to Main Menu"};
 
-const int bluetooth_NUM_SUBMENU_ITEMS = 7;
+const int bluetooth_NUM_SUBMENU_ITEMS = 8;
 const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Jammer",
     "BLE Spoofer",
     "Sour Apple",
     "Sniffer",
     "BLE Scanner",
+    "BLE Tag2 Tool",
     "BLE Rubber Ducky",
     "Back to Main Menu"};
 
@@ -265,6 +266,7 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_apple,
     bitmap_icon_analyzer,
     bitmap_icon_graph,
+    bitmap_icon_ble,
     bitmap_icon_rubber_ducky,
     bitmap_icon_go_back
 };
@@ -901,7 +903,7 @@ void handleWiFiSubmenuButtons() {
                 delay(200);
             }
         }
-        if (current_submenu_index == 6) {
+        if (current_submenu_index == 7) {
             current_submenu_index = 6;
             in_sub_menu = true;
             feature_active = true;
@@ -1219,7 +1221,7 @@ void handleBluetoothSubmenuButtons() {
         last_interaction_time = millis();
         delay(200);
 
-        if (current_submenu_index == 6) {
+        if (current_submenu_index == 7) {
             in_sub_menu = false;
             feature_active = false;
             feature_exit_requested = false;
@@ -1411,9 +1413,45 @@ void handleBluetoothSubmenuButtons() {
             in_sub_menu = true;
             feature_active = true;
             feature_exit_requested = false;
-            Ducky::enter();
+            BleTag2::bleScanSetup();
             while (current_submenu_index == 5 && !feature_exit_requested) {
                 current_submenu_index = 5;
+                in_sub_menu = true;
+                BleTag2::bleScanLoop();
+                if (isButtonPressed(BTN_SELECT)) {
+                    in_sub_menu = true;
+                    is_main_menu = false;
+                    submenu_initialized = false;
+                    feature_active = false;
+                    feature_exit_requested = false;
+                    displaySubmenu();
+                    delay(200);
+                    while (isButtonPressed(BTN_SELECT)) {
+                    }
+                    break;
+                }
+            }
+
+            BleTag2::exit();
+            if (feature_exit_requested) {
+                in_sub_menu = true;
+                is_main_menu = false;
+                submenu_initialized = false;
+                feature_active = false;
+                feature_exit_requested = false;
+                displaySubmenu();
+                delay(200);
+            }
+        }
+
+        if (current_submenu_index == 6) {
+            current_submenu_index = 6;
+            in_sub_menu = true;
+            feature_active = true;
+            feature_exit_requested = false;
+            Ducky::enter();
+            while (current_submenu_index == 6 && !feature_exit_requested) {
+                current_submenu_index = 6;
                 in_sub_menu = true;
                 Ducky::loop();
                 if (isButtonPressed(BTN_SELECT)) {
@@ -1463,7 +1501,7 @@ void handleBluetoothSubmenuButtons() {
                 displaySubmenu();
                 delay(200);
 
-                if (current_submenu_index == 6) {
+                if (current_submenu_index == 7) {
                     in_sub_menu = false;
                     feature_active = false;
                     feature_exit_requested = false;
@@ -1639,9 +1677,42 @@ void handleBluetoothSubmenuButtons() {
                     in_sub_menu = true;
                     feature_active = true;
                     feature_exit_requested = false;
-                    Ducky::enter();
+                    BleTag2::bleScanSetup();
                     while (current_submenu_index == 5 && !feature_exit_requested) {
                         current_submenu_index = 5;
+                        in_sub_menu = true;
+                        BleTag2::bleScanLoop();
+                        if (isButtonPressed(BTN_SELECT)) {
+                            in_sub_menu = true;
+                            is_main_menu = false;
+                            submenu_initialized = false;
+                            feature_active = false;
+                            feature_exit_requested = false;
+                            displaySubmenu();
+                            delay(200);
+                            while (isButtonPressed(BTN_SELECT)) {
+                            }
+                            break;
+                        }
+                    }
+                    BleTag2::exit();
+                    if (feature_exit_requested) {
+                        in_sub_menu = true;
+                        is_main_menu = false;
+                        submenu_initialized = false;
+                        feature_active = false;
+                        feature_exit_requested = false;
+                        displaySubmenu();
+                        delay(200);
+                    }
+                } else if (current_submenu_index == 6) {
+                    current_submenu_index = 6;
+                    in_sub_menu = true;
+                    feature_active = true;
+                    feature_exit_requested = false;
+                    Ducky::enter();
+                    while (current_submenu_index == 6 && !feature_exit_requested) {
+                        current_submenu_index = 6;
                         in_sub_menu = true;
                         Ducky::loop();
                         if (isButtonPressed(BTN_SELECT)) {
