@@ -1,11 +1,22 @@
 #include "SettingsStore.h"
 #include "Touchscreen.h"
 #include "config.h"
+#include <esp_gap_ble_api.h>
+#include "NimBLEAddress.h"
+#if defined(CONFIG_NIMBLE_CPP_IDF)
+#include "host/ble_hs_id.h"
+#else
+#include "nimble/nimble/host/include/host/ble_hs_id.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "icon.h"
 #include "shared.h"
 #include "utils.h"
+#include <algorithm>
+#include <math.h>
+#include <vector>
+#include <map>
 
 #ifdef TFT_BLACK
 #undef TFT_BLACK
@@ -2035,6 +2046,1508 @@ void exit() {
   }
 }
 }
+
+
+
+namespace BleTag2 {
+
+#define SCREEN_WIDTH  240
+#define SCREENHEIGHT 320
+#define STATUS_BAR_Y_OFFSET 20
+#define STATUS_BAR_HEIGHT 16
+#define ICON_SIZE 16
+#define ICON_NUM 2
+
+BLEScan* bleScan;
+BLEScanResults bleResults;
+bool isScanning = false;
+bool isDetailView = false;
+bool isSendView = false;
+int currentIndex = 0;
+int listStartIndex = 0;
+bool screenNeedsUpdate = true;
+bool fullScreenUpdate = true;
+
+static constexpr int yshift = 30;
+
+// Deauther-like list geometry (bigger rows + paging + bottom tab bar).
+static constexpr int LIST_HEADER_Y = 50;
+static constexpr int LIST_FIRST_ROW_Y = LIST_HEADER_Y + 34;
+static constexpr int LIST_ROW_H = 22;
+static constexpr int LIST_BOTTOM_Y = 300;  // keep clear of tab bar (y=304..320)
+static constexpr int DEVICES_PER_PAGE = (LIST_BOTTOM_Y - LIST_FIRST_ROW_Y) / LIST_ROW_H;
+static int current_page = 0;
+
+unsigned long lastButtonPress = 0;
+const unsigned long debounceTime = 200;
+
+static bool uiDrawn = false;
+
+static bool hasSelectedTag2 = false;
+static uint8_t selectedPayload[10] = {19, 100, 1, 14, 0, 86, 0, 12, 0, 1};
+static String selectedMac = "C0:FF:EE:C0:DE:01";
+static bool advEnabled = false;
+static bool advFastMode = true;
+static uint8_t fastHours = 14;
+static uint16_t slowHours = 86;
+static uint8_t connAttempts = 12;
+static uint8_t buttonPresses = 19;
+static uint8_t batteryLevel = 100;
+static uint8_t connectionStateCode = 0;
+static uint16_t statusFlags = 0x0001;
+static BLEAdvertising* tag2Adv = nullptr;
+static unsigned long lastAdvPulseMs = 0;
+static int selectedField = 0; // 0=F 1=S 2=C 3=B 4=BAT
+static bool baselineValid = false;
+static String baselineMac = "C0:FF:EE:C0:DE:01";
+static bool baselineFastMode = true;
+static uint8_t baselineFastHours = 14;
+static uint16_t baselineSlowHours = 86;
+static uint8_t baselineConnAttempts = 12;
+static uint8_t baselineButtonPresses = 19;
+static uint8_t baselineBatteryLevel = 100;
+static uint8_t baselineConnectionStateCode = 0;
+static uint16_t baselineStatusFlags = 0x0001;
+
+static const char* TAG2_CFG_DIR = "/config/tag2";
+static const char* TAG2_LAST_CFG = "/config/tag2/last_profile.txt";
+static const char* TAG2_RF_CFG = "/config/tag2/rf_model.cfg";
+static const char* TAG2_SCAN_LAST_CFG = "/config/tag2/last_scan_profile.txt";
+
+struct Tag2Profile {
+  bool valid = false;
+  bool manualSave = false;
+  String mac = "";
+  bool mode = true;
+  uint8_t fast_h = 14;
+  uint16_t slow_h = 86;
+  uint8_t conn = 12;
+  uint8_t btn = 19;
+  uint8_t batt = 100;
+  uint8_t state = 0;
+  uint16_t flags = 0x0001;
+};
+
+static std::map<String, Tag2Profile> lastScanProfiles;
+static TaskHandle_t liveScanTaskHandle = nullptr;
+static volatile bool liveScanRun = false;
+static volatile bool liveScanStopReq = false;
+static volatile uint32_t liveScanLastUpdateMs = 0;
+static volatile uint32_t liveResultsVersion = 0;
+static volatile uint32_t uiHoldUntilMs = 0;
+
+static int iconX[ICON_NUM] = {220, 10};
+static const unsigned char* icons[ICON_NUM] = {
+  bitmap_icon_undo,
+  bitmap_icon_go_back
+};
+static void applySendToAdvertiser();
+static bool saveProfileToSd(const Tag2Profile& p, bool updateLastPath);
+
+static void drawHeaderActionIcons(bool saveEnabled, bool loadEnabled, bool showReset, bool resetEnabled) {
+  // Compact status-bar icons, aligned with native toolbar style.
+  tft.drawBitmap(40, STATUS_BAR_Y_OFFSET, bitmap_icon_floppy, 16, 16, saveEnabled ? UI_TEXT : DARK_GRAY);   // Save
+  tft.drawBitmap(60, STATUS_BAR_Y_OFFSET, bitmap_icon_floppy2, 16, 16, loadEnabled ? UI_TEXT : DARK_GRAY);  // Load
+  tft.fillRect(80, STATUS_BAR_Y_OFFSET, 16, 16, DARK_GRAY);
+  if (showReset) {
+    tft.drawBitmap(80, STATUS_BAR_Y_OFFSET, bitmap_icon_undo, 16, 16, resetEnabled ? UI_TEXT : DARK_GRAY);     // Reset
+  }
+}
+
+static void drawButton(int x, int y, int w, int h, const char* label, bool highlight, bool disabled) {
+  FeatureUI::ButtonStyle style = highlight ? FeatureUI::ButtonStyle::Primary
+                                           : FeatureUI::ButtonStyle::Secondary;
+  FeatureUI::drawButtonRect(x, y, w, h, label, style, false, disabled);
+}
+
+static void drawTinyIconButton(int x, int y, const unsigned char* icon) {
+  drawButton(x, y, 22, 14, "", false, false);
+  if (icon) tft.drawBitmap(x + 3, y - 1, icon, 16, 16, UI_TEXT);
+}
+
+static void drawTabBar(const char* leftButton, bool leftDisabled,
+                       const char* prevButton, bool prevDisabled,
+                       const char* nextButton, bool nextDisabled) {
+  tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
+  if (leftButton[0]) drawButton(0,   304, 57, 16, leftButton, false, leftDisabled);
+  if (prevButton[0]) drawButton(117, 304, 57, 16, prevButton, false, prevDisabled);
+  if (nextButton[0]) drawButton(177, 304, 57, 16, nextButton, false, nextDisabled);
+}
+
+static TaskHandle_t bgBleScanTaskHandle = nullptr;
+static volatile bool bgHasResults = false;
+static volatile uint32_t bgLastScanMs = 0;
+static const uint32_t BG_BLE_SCAN_INTERVAL_MS = 15000;
+static bool bleInitDone = false;
+static const uint32_t BG_BOOT_GRACE_MS = 6000;
+static uint32_t bgBootMs = 0;
+static std::vector<int> tag2Indices;
+static std::vector<Tag2Profile> loadedProfileList;
+static bool showingLoadedProfiles = false;
+static bool headerIconsDirty = true;
+static int8_t distanceTxPowerAt1m = -59;
+static uint8_t distanceN_x10 = 20; // n=2.0 default
+
+static bool parseTag2Payload(BLEAdvertisedDevice& device, uint8_t out[10]) {
+  std::string md = device.getManufacturerData();
+  if (md.size() < 12) return false;
+  const uint8_t* b = (const uint8_t*)md.data();
+  if (b[0] != 0x00 || b[1] != 0xFF) return false;
+  memcpy(out, b + 2, 10);
+  return true;
+}
+
+static void rebuildTag2Index() {
+  tag2Indices.clear();
+  const int total = bleResults.getCount();
+  for (int i = 0; i < total; i++) {
+    BLEAdvertisedDevice d = bleResults.getDevice(i);
+    uint8_t p[10];
+    if (parseTag2Payload(d, p)) {
+      tag2Indices.push_back(i);
+    }
+  }
+  std::sort(tag2Indices.begin(), tag2Indices.end(), [](int a, int b) {
+    BLEAdvertisedDevice da = bleResults.getDevice(a);
+    BLEAdvertisedDevice db = bleResults.getDevice(b);
+    return da.getRSSI() > db.getRSSI();
+  });
+}
+
+static int filteredCount() {
+  if (showingLoadedProfiles) return (int)loadedProfileList.size();
+  return (int)tag2Indices.size();
+}
+
+static BLEAdvertisedDevice filteredDevice(int filteredIdx) {
+  return bleResults.getDevice(tag2Indices[filteredIdx]);
+}
+
+static Tag2Profile filteredProfile(int filteredIdx) {
+  if (filteredIdx < 0 || filteredIdx >= (int)loadedProfileList.size()) return Tag2Profile();
+  return loadedProfileList[filteredIdx];
+}
+
+static void rebuildLoadedProfileListFromCache() {
+  loadedProfileList.clear();
+  for (const auto& kv : lastScanProfiles) {
+    if (kv.second.valid) loadedProfileList.push_back(kv.second);
+  }
+  std::sort(loadedProfileList.begin(), loadedProfileList.end(), [](const Tag2Profile& a, const Tag2Profile& b) {
+    return a.mac < b.mac;
+  });
+}
+
+static int batteryStepWithJitter() {
+  int jitter = random(-3, 4); // [-3, +3]
+  int step = 5 + jitter;
+  if (step < 1) step = 1;
+  return step;
+}
+
+static float estimateDistanceMeters(int rssi) {
+  if (rssi == 0) return -1.0f;
+  const float n = ((float)distanceN_x10) / 10.0f;
+  if (n <= 0.0f) return -1.0f;
+  const float exponent = ((float)distanceTxPowerAt1m - (float)rssi) / (10.0f * n);
+  return powf(10.0f, exponent);
+}
+
+static String formatDistance(float meters) {
+  if (meters < 0.0f) return "?";
+  if (meters < 1.0f) {
+    int cm = (int)(meters * 100.0f + 0.5f);
+    return String(cm) + "cm";
+  }
+  if (meters < 10.0f) {
+    char b[16];
+    snprintf(b, sizeof(b), "%.1fm", meters);
+    return String(b);
+  }
+  int m = (int)(meters + 0.5f);
+  return String(m) + "m";
+}
+
+static String macToCfgPath(const String& mac) {
+  String safe = mac;
+  safe.replace(":", "-");
+  safe.toUpperCase();
+  return String(TAG2_CFG_DIR) + "/" + safe + ".cfg";
+}
+
+static bool jsonGetString(const String& s, const char* key, String& out) {
+  String k = "\"" + String(key) + "\"";
+  int p = s.indexOf(k);
+  if (p < 0) return false;
+  p = s.indexOf(':', p + k.length());
+  if (p < 0) return false;
+  int q1 = s.indexOf('"', p + 1);
+  if (q1 < 0) return false;
+  int q2 = s.indexOf('"', q1 + 1);
+  if (q2 < 0) return false;
+  out = s.substring(q1 + 1, q2);
+  return true;
+}
+
+static bool jsonGetInt(const String& s, const char* key, int& out) {
+  String k = "\"" + String(key) + "\"";
+  int p = s.indexOf(k);
+  if (p < 0) return false;
+  p = s.indexOf(':', p + k.length());
+  if (p < 0) return false;
+  int i = p + 1;
+  while (i < (int)s.length() && (s[i] == ' ' || s[i] == '\t')) i++;
+  int j = i;
+  while (j < (int)s.length() && (s[j] == '-' || (s[j] >= '0' && s[j] <= '9'))) j++;
+  if (j <= i) return false;
+  out = s.substring(i, j).toInt();
+  return true;
+}
+
+static bool saveRfModelToSd() {
+  if (!SD.exists("/config")) SD.mkdir("/config");
+  if (!SD.exists(TAG2_CFG_DIR)) SD.mkdir(TAG2_CFG_DIR);
+  if (SD.exists(TAG2_RF_CFG)) SD.remove(TAG2_RF_CFG);
+  File f = SD.open(TAG2_RF_CFG, FILE_WRITE);
+  if (!f) return false;
+  f.printf("tx1m=%d\n", (int)distanceTxPowerAt1m);
+  f.printf("n_x10=%u\n", (unsigned)distanceN_x10);
+  f.close();
+  return true;
+}
+
+static bool loadRfModelFromSd() {
+  File f = SD.open(TAG2_RF_CFG, FILE_READ);
+  if (!f) return false;
+  int tx1m = (int)distanceTxPowerAt1m;
+  int n10 = (int)distanceN_x10;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    int eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    String k = line.substring(0, eq);
+    String v = line.substring(eq + 1);
+    k.trim(); v.trim();
+    if (k == "tx1m") tx1m = v.toInt();
+    else if (k == "n_x10") n10 = v.toInt();
+  }
+  f.close();
+  distanceTxPowerAt1m = (int8_t)constrain(tx1m, -100, -20);
+  distanceN_x10 = (uint8_t)constrain(n10, 10, 40);
+  return true;
+}
+
+static void captureBaselineFromCurrent() {
+  baselineValid = true;
+  baselineMac = selectedMac;
+  baselineFastMode = advFastMode;
+  baselineFastHours = fastHours;
+  baselineSlowHours = slowHours;
+  baselineConnAttempts = connAttempts;
+  baselineButtonPresses = buttonPresses;
+  baselineBatteryLevel = batteryLevel;
+  baselineConnectionStateCode = connectionStateCode;
+  baselineStatusFlags = statusFlags;
+}
+
+static void restoreBaseline() {
+  if (!baselineValid) return;
+  selectedMac = baselineMac;
+  advFastMode = baselineFastMode;
+  fastHours = baselineFastHours;
+  slowHours = baselineSlowHours;
+  connAttempts = baselineConnAttempts;
+  buttonPresses = baselineButtonPresses;
+  batteryLevel = baselineBatteryLevel;
+  connectionStateCode = baselineConnectionStateCode;
+  statusFlags = baselineStatusFlags;
+  applySendToAdvertiser();
+}
+
+static bool saveCurrentSendConfigToSd() {
+  Tag2Profile p;
+  p.valid = true;
+  p.manualSave = true;
+  p.mac = selectedMac;
+  p.mode = advFastMode;
+  p.fast_h = fastHours;
+  p.slow_h = slowHours;
+  p.conn = connAttempts;
+  p.btn = buttonPresses;
+  p.batt = batteryLevel;
+  p.state = connectionStateCode;
+  p.flags = statusFlags;
+  return saveProfileToSd(p, true);
+}
+
+static bool parseProfileFromJson(const String& all, Tag2Profile& p) {
+  if (!all.startsWith("{")) return false;
+  int v = 0;
+  String mac;
+  if (jsonGetString(all, "mac", mac)) p.mac = mac;
+  if (jsonGetInt(all, "manual_save", v)) p.manualSave = (v != 0);
+  if (jsonGetInt(all, "mode", v)) p.mode = (v != 0);
+  if (jsonGetInt(all, "fast_h", v)) p.fast_h = (uint8_t)constrain(v, 0, 255);
+  if (jsonGetInt(all, "slow_h", v)) p.slow_h = (uint16_t)constrain(v, 0, 65535);
+  if (jsonGetInt(all, "conn", v)) p.conn = (uint8_t)constrain(v, 0, 255);
+  if (jsonGetInt(all, "btn", v)) p.btn = (uint8_t)constrain(v, 0, 255);
+  if (jsonGetInt(all, "batt", v)) p.batt = (uint8_t)constrain(v, 0, 100);
+  if (jsonGetInt(all, "state", v)) p.state = (uint8_t)constrain(v, 0, 255);
+  if (jsonGetInt(all, "flags", v)) p.flags = (uint16_t)constrain(v, 0, 65535);
+  p.valid = p.mac.length() == 17;
+  return p.valid;
+}
+
+static void applyProfile(const Tag2Profile& p) {
+  if (!p.valid) return;
+  selectedMac = p.mac;
+  advFastMode = p.mode;
+  fastHours = p.fast_h;
+  slowHours = p.slow_h;
+  connAttempts = p.conn;
+  buttonPresses = p.btn;
+  batteryLevel = p.batt;
+  connectionStateCode = p.state;
+  statusFlags = p.flags;
+  applySendToAdvertiser();
+}
+
+static bool saveProfileToSd(const Tag2Profile& p, bool updateLastPath) {
+  if (!p.valid || p.mac.length() != 17) return false;
+  if (!SD.exists("/config")) SD.mkdir("/config");
+  if (!SD.exists(TAG2_CFG_DIR)) SD.mkdir(TAG2_CFG_DIR);
+  String cfgPath = macToCfgPath(p.mac);
+  if (SD.exists(cfgPath)) SD.remove(cfgPath);
+  File f = SD.open(cfgPath, FILE_WRITE);
+  if (!f) return false;
+  f.printf("{\"manual_save\":%s,\"mac\":\"%s\",\"mode\":%d,\"fast_h\":%u,\"slow_h\":%u,\"conn\":%u,\"btn\":%u,\"batt\":%u,\"state\":%u,\"flags\":%u}\n",
+           p.manualSave ? "true" : "false",
+           p.mac.c_str(),
+           p.mode ? 1 : 0,
+           (unsigned)p.fast_h,
+           (unsigned)p.slow_h,
+           (unsigned)p.conn,
+           (unsigned)p.btn,
+           (unsigned)p.batt,
+           (unsigned)p.state,
+           (unsigned)p.flags);
+  f.close();
+
+  if (updateLastPath) {
+    if (SD.exists(TAG2_LAST_CFG)) SD.remove(TAG2_LAST_CFG);
+    File lf = SD.open(TAG2_LAST_CFG, FILE_WRITE);
+    if (!lf) return false;
+    lf.println(cfgPath);
+    lf.close();
+  }
+  return true;
+}
+
+static bool saveScanProfilesToSd() {
+  bool ok = false;
+  for (const auto& kv : lastScanProfiles) {
+    Tag2Profile p = kv.second;
+    p.manualSave = false;
+    ok |= saveProfileToSd(p, false);
+  }
+  if (ok) {
+    if (SD.exists(TAG2_SCAN_LAST_CFG)) SD.remove(TAG2_SCAN_LAST_CFG);
+    File sf = SD.open(TAG2_SCAN_LAST_CFG, FILE_WRITE);
+    if (sf) {
+      sf.println("scan_dump");
+      sf.close();
+    }
+  }
+  return ok;
+}
+
+static bool loadConfigFromPath(const String& cfgPath) {
+  File f = SD.open(cfgPath, FILE_READ);
+  if (!f) return false;
+  String all = f.readString();
+  f.close();
+  all.trim();
+
+  if (all.startsWith("{")) {
+    String mac;
+    int v = 0;
+    if (jsonGetString(all, "mac", mac)) selectedMac = mac;
+    if (jsonGetInt(all, "mode", v)) advFastMode = (v != 0);
+    if (jsonGetInt(all, "fast_h", v)) fastHours = (uint8_t)constrain(v, 0, 255);
+    if (jsonGetInt(all, "slow_h", v)) slowHours = (uint16_t)constrain(v, 0, 65535);
+    if (jsonGetInt(all, "conn", v)) connAttempts = (uint8_t)constrain(v, 0, 255);
+    if (jsonGetInt(all, "btn", v)) buttonPresses = (uint8_t)constrain(v, 0, 255);
+    if (jsonGetInt(all, "batt", v)) batteryLevel = (uint8_t)constrain(v, 0, 100);
+    if (jsonGetInt(all, "state", v)) connectionStateCode = (uint8_t)constrain(v, 0, 255);
+    if (jsonGetInt(all, "flags", v)) statusFlags = (uint16_t)constrain(v, 0, 65535);
+  } else {
+    // Backward compatibility for legacy key=value profiles.
+    int start = 0;
+    while (start < (int)all.length()) {
+      int end = all.indexOf('\n', start);
+      if (end < 0) end = all.length();
+      String line = all.substring(start, end);
+      line.trim();
+      start = end + 1;
+      if (!line.length()) continue;
+      int eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      String k = line.substring(0, eq);
+      String vv = line.substring(eq + 1);
+      k.trim();
+      vv.trim();
+      if (k == "mac") selectedMac = vv;
+      else if (k == "mode") advFastMode = (vv.toInt() != 0);
+      else if (k == "fast_h") fastHours = (uint8_t)constrain(vv.toInt(), 0, 255);
+      else if (k == "slow_h") slowHours = (uint16_t)constrain(vv.toInt(), 0, 65535);
+      else if (k == "conn") connAttempts = (uint8_t)constrain(vv.toInt(), 0, 255);
+      else if (k == "btn") buttonPresses = (uint8_t)constrain(vv.toInt(), 0, 255);
+      else if (k == "batt") batteryLevel = (uint8_t)constrain(vv.toInt(), 0, 100);
+      else if (k == "state") connectionStateCode = (uint8_t)constrain(vv.toInt(), 0, 255);
+      else if (k == "flags") statusFlags = (uint16_t)constrain(vv.toInt(), 0, 65535);
+    }
+  }
+  applySendToAdvertiser();
+  return true;
+}
+
+static bool loadLastSendConfigFromSd() {
+  File lf = SD.open(TAG2_LAST_CFG, FILE_READ);
+  if (!lf) return false;
+  String cfgPath = lf.readStringUntil('\n');
+  lf.close();
+  cfgPath.trim();
+  if (!cfgPath.length()) return false;
+  return loadConfigFromPath(cfgPath);
+}
+
+static bool loadProfileForMac(const String& mac, bool requiredManualSave) {
+  const String cfgPath = macToCfgPath(mac);
+  File f = SD.open(cfgPath, FILE_READ);
+  if (!f) return false;
+  String all = f.readString();
+  f.close();
+  all.trim();
+  Tag2Profile p;
+  if (!parseProfileFromJson(all, p)) {
+    return loadConfigFromPath(cfgPath);
+  }
+  if (p.manualSave != requiredManualSave) return false;
+  applyProfile(p);
+  return true;
+}
+
+static bool loadProfilesFromSdAsScan(bool requiredManualFalse) {
+  File dir = SD.open(TAG2_CFG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  lastScanProfiles.clear();
+  bool foundPrimary = false;
+  for (;;) {
+    File f = dir.openNextFile();
+    if (!f) break;
+    if (f.isDirectory()) {
+      f.close();
+      continue;
+    }
+    String name = String(f.name());
+    if (!name.endsWith(".cfg")) {
+      f.close();
+      continue;
+    }
+    String all = f.readString();
+    f.close();
+    all.trim();
+    Tag2Profile p;
+    if (!parseProfileFromJson(all, p)) continue;
+
+    if (p.manualSave != !requiredManualFalse) continue;
+    foundPrimary = true;
+    lastScanProfiles[p.mac] = p;
+  }
+  dir.close();
+  if (foundPrimary) return !lastScanProfiles.empty();
+
+  // Fallback for SCAN load: if no scan profiles exist, accept manual profiles.
+  File dir2 = SD.open(TAG2_CFG_DIR);
+  if (!dir2 || !dir2.isDirectory()) return false;
+  for (;;) {
+    File f = dir2.openNextFile();
+    if (!f) break;
+    if (f.isDirectory()) {
+      f.close();
+      continue;
+    }
+    String name = String(f.name());
+    if (!name.endsWith(".cfg")) {
+      f.close();
+      continue;
+    }
+    String all = f.readString();
+    f.close();
+    all.trim();
+    Tag2Profile p;
+    if (!parseProfileFromJson(all, p)) continue;
+    if (!p.manualSave) continue;
+    lastScanProfiles[p.mac] = p;
+  }
+  dir2.close();
+  return !lastScanProfiles.empty();
+}
+
+static bool parseMacToBytes(const String& mac, uint8_t out[6]) {
+  if (mac.length() != 17) return false;
+  int vals[6];
+  if (sscanf(mac.c_str(), "%02x:%02x:%02x:%02x:%02x:%02x",
+             &vals[0], &vals[1], &vals[2], &vals[3], &vals[4], &vals[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t)vals[i];
+  return true;
+}
+
+static void buildTag2AdvRaw(uint8_t out[31], uint8_t& outLen) {
+  memset(out, 0, 31);
+  uint8_t p[10];
+  p[0] = buttonPresses;
+  p[1] = batteryLevel;
+  p[2] = advFastMode ? 1 : 0;
+  p[3] = fastHours;
+  p[4] = (uint8_t)(slowHours >> 8);
+  p[5] = (uint8_t)(slowHours & 0xFF);
+  p[6] = connectionStateCode;
+  p[7] = connAttempts;
+  p[8] = (uint8_t)(statusFlags >> 8);
+  p[9] = (uint8_t)(statusFlags & 0xFF);
+  uint8_t i = 0;
+  out[i++] = 0x02; out[i++] = 0x01; out[i++] = 0x06;
+  out[i++] = 0x0D; out[i++] = 0xFF; out[i++] = 0x00; out[i++] = 0xFF;
+  memcpy(out + i, p, 10); i += 10;
+  const char* dn = "BLE Tag2";
+  uint8_t n = (uint8_t)strlen(dn);
+  out[i++] = (uint8_t)(n + 1);
+  out[i++] = 0x09;
+  memcpy(out + i, dn, n); i += n;
+  outLen = i;
+}
+
+static void applySendToAdvertiser() {
+  if (!tag2Adv) {
+    tag2Adv = BLEDevice::getAdvertising();
+  }
+
+  tag2Adv->stop();
+  delay(20);
+
+  // BLE interval units are 0.625 ms:
+  // FAST 200 ms => 320 (0x0140), SLOW 2000 ms => 3200 (0x0C80)
+  const uint16_t advInterval = advFastMode ? 0x0140 : 0x0C80;
+  tag2Adv->setMinInterval(advInterval);
+  tag2Adv->setMaxInterval(advInterval);
+
+  // Keep advertising scanner-friendly across tools/phones/sniffers.
+  tag2Adv->setScanResponse(false);
+  // NimBLE expects BLE_GAP_CONN_MODE_* (not Bluedroid ADV_TYPE_* values).
+  tag2Adv->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
+
+  // Desired behavior: use custom static-random MAC selected in UI.
+  // With NimBLE we must program the random identity via ble_hs_id_set_rnd().
+  bool customRndOk = false;
+  uint8_t macBytes[6];
+  if (parseMacToBytes(selectedMac, macBytes)) {
+    // Static-random: two MSBs of first octet must be 11.
+    macBytes[0] = (uint8_t)((macBytes[0] & 0x3F) | 0xC0);
+    NimBLEAddress rndAddr(macBytes, BLE_ADDR_RANDOM);
+    int rc = ble_hs_id_set_rnd(rndAddr.getNative());
+    customRndOk = (rc == 0);
+    if (customRndOk) {
+      BLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM, false);
+    }
+    Serial.printf("[TAG2] ble_hs_id_set_rnd(%s) -> %d\n", selectedMac.c_str(), rc);
+  }
+
+  uint8_t raw[31], rawLen = 0;
+  buildTag2AdvRaw(raw, rawLen);
+  BLEAdvertisementData ad = BLEAdvertisementData();
+  ad.addData(std::string((char*)raw, rawLen));
+  tag2Adv->setAdvertisementData(ad);
+
+  Serial.printf("[TAG2] ADV cfg mode=%s enabled=%d interval=0x%04X rawLen=%u ownAddr=%s\n",
+                advFastMode ? "FAST" : "SLOW",
+                advEnabled ? 1 : 0,
+                advInterval,
+                (unsigned)rawLen,
+                customRndOk ? "RANDOM(custom)" : "RANDOM(failed)");
+
+  if (advEnabled) {
+    bool ok = tag2Adv->start();
+    Serial.printf("[TAG2] ADV start returned=%d\n", ok ? 1 : 0);
+  }
+}
+
+static void drawSendView() {
+  drawHeaderActionIcons(true, true, true, true);
+  tft.fillRect(0, 37, 240, 320 - 37, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(GREEN, TFT_BLACK);
+  tft.setCursor(8, 50); tft.print("SEND MODE - TAG2");
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(8, 66); tft.print("TX MAC: "); tft.print(selectedMac);
+  tft.setCursor(8, 80); tft.print("Mode: "); tft.print(advFastMode ? "FAST" : "SLOW");
+  tft.print("  Batt:"); tft.print((int)batteryLevel);
+  tft.print("  PW: "); tft.print(advEnabled ? "ON" : "OFF");
+
+  const int y0 = 102;
+  const int rowH = 22;
+  const char* names[5] = {"FastH", "SlowH", "Conn", "Btn", "Batt"};
+  int vals[5] = {fastHours, (int)slowHours, connAttempts, buttonPresses, batteryLevel};
+  for (int i = 0; i < 5; i++) {
+    int y = y0 + i * rowH;
+    tft.setTextColor(i == selectedField ? ORANGE : WHITE, TFT_BLACK);
+    tft.setCursor(8, y); tft.print(names[i]);
+    tft.setCursor(70, y); tft.print(": ");
+    tft.print(vals[i]);
+    // Tiny per-field controls on the right of value: -, +, reset.
+    drawButton(146, y - 2, 16, 14, "-", false, false);
+    drawButton(164, y - 2, 16, 14, "+", false, false);
+    if (i < 4) drawButton(186, y - 2, 16, 14, "0", false, false);
+    if (i == 4) drawButton(204, y - 2, 18, 14, "M", false, false);
+  }
+
+  // Last row: BACK + MODE on left, PW ON/OFF on right.
+  tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
+  drawButton(0, 304, 57, 16, "Back", false, false);
+  drawButton(60, 304, 57, 16, "Mode", false, false);
+  drawButton(177, 304, 57, 16, advEnabled ? "On" : "Off", false, false);
+}
+
+static void ensureBleInit() {
+  if (bleInitDone) return;
+
+  bleScan = BLEDevice::getScan();
+  bleScan->setActiveScan(true);
+  bleInitDone = true;
+}
+
+static void cacheProfilesFromCurrentResults() {
+  const int n = filteredCount();
+  for (int i = 0; i < n; i++) {
+    BLEAdvertisedDevice d = filteredDevice(i);
+    uint8_t p[10];
+    if (!parseTag2Payload(d, p)) continue;
+    Tag2Profile tp;
+    tp.valid = true;
+    tp.manualSave = false;
+    tp.mac = String(d.getAddress().toString().c_str());
+    tp.mode = p[2] ? true : false;
+    tp.fast_h = p[3];
+    tp.slow_h = ((uint16_t)p[4] << 8) | p[5];
+    tp.state = p[6];
+    tp.conn = p[7];
+    tp.flags = ((uint16_t)p[8] << 8) | p[9];
+    tp.btn = p[0];
+    tp.batt = (uint8_t)constrain((int)p[1], 0, 100);
+    lastScanProfiles[tp.mac] = tp;
+  }
+}
+
+static void liveScanTask(void*) {
+  ensureBleInit();
+  while (liveScanRun) {
+    isScanning = true;
+    bleResults = bleScan->start(2, false);
+    rebuildTag2Index();
+    cacheProfilesFromCurrentResults();
+    liveScanLastUpdateMs = millis();
+    liveResultsVersion++;
+    if (millis() >= uiHoldUntilMs) {
+      // Ask UI to update only when user is on scan list.
+      if (!isSendView && !isDetailView) {
+        screenNeedsUpdate = true;
+      }
+    }
+    if (liveScanStopReq) break;
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+  isScanning = false;
+  liveScanRun = false;
+  liveScanTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+
+static void startLiveScan() {
+  if (liveScanRun) return;
+  liveScanStopReq = false;
+  liveScanRun = true;
+  xTaskCreatePinnedToCore(liveScanTask, "tag2LiveScan", 4096, nullptr, 1, &liveScanTaskHandle, 0);
+}
+
+static void stopLiveScan() {
+  liveScanStopReq = true;
+  if (bleScan) bleScan->stop();
+  uint32_t t0 = millis();
+  while (liveScanRun && (millis() - t0) < 1200) {
+    delay(10);
+  }
+  isScanning = false;
+}
+
+void displayScanning() {
+  tft.fillRect(0, 37, 240, 320, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(GREEN);
+  tft.setCursor(10, LIST_HEADER_Y);
+  tft.println("Scanning...");
+  tft.setCursor(10, LIST_HEADER_Y + 12);
+  tft.println("Wait a moment.");
+}
+
+static void bgBleScanTask(void* ) {
+  ensureBleInit();
+  for (;;) {
+    const uint32_t now = millis();
+    if (bgBootMs == 0) bgBootMs = now;
+
+    const bool idleOk = (now - bgBootMs) > BG_BOOT_GRACE_MS;
+    if (settings().autoBleScan && idleOk && !feature_active && !in_sub_menu) {
+      isScanning = true;
+
+      bleResults = bleScan->start(2, false);
+      rebuildTag2Index();
+      isScanning = false;
+      if (bleResults.getCount() >= 0) {
+        bgHasResults = (filteredCount() > 0);
+        bgLastScanMs = now;
+      }
+      vTaskDelay(BG_BLE_SCAN_INTERVAL_MS / portTICK_PERIOD_MS);
+    } else {
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+void startBLEScan() {
+  stopLiveScan();
+  displayScanning();
+  // Fresh scan session: drop all previous in-memory scan/profile data.
+  lastScanProfiles.clear();
+  loadedProfileList.clear();
+  showingLoadedProfiles = false;
+  tag2Indices.clear();
+  isDetailView = false;
+  current_page = 0;
+  currentIndex = 0;
+  listStartIndex = 0;
+  screenNeedsUpdate = true;
+  fullScreenUpdate = true;
+  headerIconsDirty = true;
+  ensureBleInit();
+  isScanning = true;
+  bleResults = bleScan->start(5, false);
+  rebuildTag2Index();
+  cacheProfilesFromCurrentResults();
+  isScanning = false;
+  screenNeedsUpdate = true;
+}
+
+void handleButtons() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastButtonPress < debounceTime) return;
+
+  int oldPage = current_page;
+
+  if (!pcf.digitalRead(BTN_UP)) {
+    if (!isDetailView && currentIndex > 0) {
+      currentIndex--;
+      delay(200);
+      current_page = currentIndex / max(1, DEVICES_PER_PAGE);
+      listStartIndex = current_page * DEVICES_PER_PAGE;
+      screenNeedsUpdate = true;
+      fullScreenUpdate = (current_page != oldPage);
+    }
+    lastButtonPress = currentMillis;
+  }
+
+  if (!pcf.digitalRead(BTN_DOWN)) {
+    if (!isDetailView && currentIndex < filteredCount() - 1) {
+      currentIndex++;
+      delay(200);
+      current_page = currentIndex / max(1, DEVICES_PER_PAGE);
+      listStartIndex = current_page * DEVICES_PER_PAGE;
+      screenNeedsUpdate = true;
+      fullScreenUpdate = (current_page != oldPage);
+    }
+    lastButtonPress = currentMillis;
+  }
+
+  if (!pcf.digitalRead(BTN_RIGHT)) {
+    delay(200);
+    if (!isScanning) {
+      isDetailView = !isDetailView;
+      screenNeedsUpdate = true;
+      fullScreenUpdate = true;
+    }
+    lastButtonPress = currentMillis;
+  }
+
+  if (!pcf.digitalRead(BTN_LEFT)) {
+    delay(200);
+    if (isDetailView) {
+      isDetailView = false;
+      fullScreenUpdate = true;
+    } else if (!isScanning) {
+      startBLEScan();
+      fullScreenUpdate = true;
+    }
+    screenNeedsUpdate = true;
+    lastButtonPress = currentMillis;
+  }
+}
+
+void updateBLEList() {
+  int deviceCount = filteredCount();
+  tft.setTextSize(1);
+  static uint32_t lastRenderedVersion = 0;
+
+  if (deviceCount <= 0) {
+    tft.fillRect(0, 37, 240, 320 - 37, TFT_BLACK);
+    tft.setTextColor(GREEN);
+    tft.setCursor(10, LIST_HEADER_Y);
+    tft.println("No devices found.");
+    tft.setCursor(10, LIST_HEADER_Y + 12);
+    tft.println("Press Rescan.");
+    drawTabBar("Rescan", false, "Prev", true, "Next", true);
+    return;
+  }
+
+  const int totalPages = (deviceCount + DEVICES_PER_PAGE - 1) / DEVICES_PER_PAGE;
+  if (current_page < 0) current_page = 0;
+  if (current_page > totalPages - 1) current_page = max(0, totalPages - 1);
+  listStartIndex = current_page * DEVICES_PER_PAGE;
+
+  static int last_rendered_page = -1;
+  static int last_rendered_index = -1;
+
+  auto drawRow = [&](int idx, bool selected) {
+    if (idx < 0 || idx >= deviceCount) return;
+    if (idx < listStartIndex || idx >= listStartIndex + DEVICES_PER_PAGE) return;
+    const int row = idx - listStartIndex;
+    const int y = LIST_FIRST_ROW_Y + row * LIST_ROW_H;
+
+    // Clear only this row (avoid overlapping next row).
+    tft.fillRect(0, y, SCREEN_WIDTH, LIST_ROW_H, TFT_BLACK);
+    String rowTxt;
+    if (showingLoadedProfiles) {
+      Tag2Profile p = filteredProfile(idx);
+      rowTxt = p.mac + " SD";
+    } else {
+      BLEAdvertisedDevice device = filteredDevice(idx);
+      float dMeters = estimateDistanceMeters(device.getRSSI());
+      rowTxt = "RSSI:" + String(device.getRSSI()) + " D:" + formatDistance(dMeters);
+    }
+    if (rowTxt.length() > 27) rowTxt = rowTxt.substring(0, 27);
+
+    tft.setCursor(10, y);
+    tft.setTextColor(selected ? ORANGE : WHITE);
+    tft.print(selected ? "> " : "  ");
+    tft.println(rowTxt);
+  };
+
+  const bool pageChanged = (current_page != last_rendered_page);
+  const bool versionChanged = false;
+  const bool needFull = fullScreenUpdate || pageChanged || (last_rendered_index < 0) || versionChanged;
+
+  if (needFull) {
+    tft.fillRect(0, 37, 240, 320 - 37, TFT_BLACK);
+    tft.setTextColor(GREEN);
+    tft.setCursor(10, LIST_HEADER_Y);
+    tft.println("BLE Tag2:");
+
+    if (!showingLoadedProfiles) {
+      // Distance model setup row: [icon][-/+][value] for Tx and n.
+      tft.drawBitmap(8, 61, bitmap_icon_antenna2, 16, 16, ORANGE);
+      drawButton(24, 62, 16, 14, "-", false, false);
+      drawButton(42, 62, 16, 14, "+", false, false);
+      tft.setTextColor(WHITE, TFT_BLACK);
+      tft.setCursor(60, 66);
+      tft.print("Tx:");
+      tft.print((int)distanceTxPowerAt1m);
+
+      tft.drawBitmap(116, 61, bitmap_icon_graph_self_loop, 16, 16, ORANGE);
+      drawButton(132, 62, 16, 14, "-", false, false);
+      drawButton(150, 62, 16, 14, "+", false, false);
+      tft.setCursor(170, 66);
+      tft.print("n:");
+      tft.print(((float)distanceN_x10) / 10.0f, 1);
+    } else {
+      tft.setTextColor(WHITE, TFT_BLACK);
+      tft.setCursor(10, 66);
+      tft.print("Loaded profiles");
+    }
+
+    char page_buf[20];
+    snprintf(page_buf, sizeof(page_buf), "Page %d/%d", current_page + 1, totalPages);
+    tft.setCursor(180, LIST_HEADER_Y);
+    tft.setTextColor(GREEN);
+    tft.println(page_buf);
+
+    const int end_index = min(listStartIndex + DEVICES_PER_PAGE, deviceCount);
+    for (int i = listStartIndex; i < end_index; i++) {
+      drawRow(i, (i == currentIndex));
+    }
+
+    const bool prevDisabled = (current_page == 0);
+    const bool nextDisabled = ((current_page + 1) * DEVICES_PER_PAGE >= deviceCount);
+    drawTabBar("Rescan", false, "Prev", prevDisabled, "Next", nextDisabled);
+
+    last_rendered_page = current_page;
+    last_rendered_index = currentIndex;
+    lastRenderedVersion = liveResultsVersion;
+    return;
+  }
+
+  if (last_rendered_index != currentIndex) {
+    drawRow(last_rendered_index, false);
+    drawRow(currentIndex, true);
+    last_rendered_index = currentIndex;
+  }
+}
+
+void displayBLEDetails() {
+
+  tft.fillRect(0, 37, 240, 320, TFT_BLACK);
+  tft.setTextSize(1);
+
+  const int deviceCount = filteredCount();
+  if (deviceCount <= 0) {
+    isDetailView = false;
+    screenNeedsUpdate = true;
+    fullScreenUpdate = true;
+    return;
+  }
+  if (currentIndex < 0) currentIndex = 0;
+  if (currentIndex >= deviceCount) currentIndex = deviceCount - 1;
+
+  if (showingLoadedProfiles) {
+    Tag2Profile p = filteredProfile(currentIndex);
+    hasSelectedTag2 = p.valid;
+    if (!p.valid) return;
+    selectedMac = p.mac;
+    advFastMode = p.mode;
+    fastHours = p.fast_h;
+    slowHours = p.slow_h;
+    connAttempts = p.conn;
+    buttonPresses = p.btn;
+    batteryLevel = p.batt;
+    connectionStateCode = p.state;
+    statusFlags = p.flags;
+    captureBaselineFromCurrent();
+
+    int y = 50;
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(10, y); tft.print("Device: BLE Tag2 (SD)");
+    y += 20;
+    tft.setCursor(10, y); tft.print("MAC: " + p.mac);
+    y += 20;
+    tft.setCursor(10, y); tft.print("Mode: " + String(p.mode ? "FAST" : "SLOW"));
+    y += 20;
+    tft.setCursor(10, y); tft.print("FastH: " + String((int)p.fast_h));
+    y += 20;
+    tft.setCursor(10, y); tft.print("SlowH: " + String((int)p.slow_h));
+    y += 20;
+    tft.setCursor(10, y); tft.print("Conn: " + String((int)p.conn) + " Btn: " + String((int)p.btn));
+    y += 20;
+    tft.setCursor(10, y); tft.print("Batt: " + String((int)p.batt));
+    drawTabBar("Back", false, "", true, "Use", !hasSelectedTag2);
+    return;
+  }
+
+  BLEAdvertisedDevice device = filteredDevice(currentIndex);
+  String deviceName = device.getName().length() > 0 ? device.getName().c_str() : "Unknown Device";
+  String address = device.getAddress().toString().c_str();
+  int rssi = device.getRSSI();
+  int txPower = device.getTXPower();
+  float dMeters = estimateDistanceMeters(rssi);
+
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+
+  int y = 50;
+  tft.setCursor(10, y);
+  tft.print("Device: " + deviceName);
+  y += 20;
+  tft.setCursor(10, y);
+  tft.print("MAC: " + address);
+  y += 20;
+  tft.setCursor(10, y);
+  tft.print("RSSI: " + String(rssi) + " dBm");
+  y += 20;
+  tft.setCursor(10, y);
+  tft.print("Tx Power: " + String(txPower) + " dBm");
+  y += 20;
+  tft.setCursor(10, y);
+  tft.print("Dist: " + formatDistance(dMeters) + " (Tx@" + String((int)distanceTxPowerAt1m) + " n=" + String(((float)distanceN_x10) / 10.0f, 1) + ")");
+
+  if (device.haveServiceUUID()) {
+    y += 20;
+    tft.setCursor(10, y);
+    tft.print("Service UUID: " + String(device.getServiceUUID().toString().c_str()));
+  } else {
+    y += 20;
+    tft.setCursor(10, y);
+    tft.print("No Service UUID");
+  }
+  hasSelectedTag2 = false;
+  if (device.haveManufacturerData()) {
+    String manufacturerData = String((char*)device.getManufacturerData().c_str());
+    y += 20;
+    tft.setCursor(10, y);
+    tft.print("Manufacturer: " + manufacturerData);
+    uint8_t p[10];
+    if (parseTag2Payload(device, p)) {
+      hasSelectedTag2 = true;
+      memcpy(selectedPayload, p, sizeof(selectedPayload));
+      selectedMac = address;
+      buttonPresses = p[0];
+      batteryLevel = (uint8_t)constrain((int)p[1], 0, 100);
+      fastHours = p[3];
+      slowHours = ((uint16_t)p[4] << 8) | p[5];
+      connectionStateCode = p[6];
+      connAttempts = p[7];
+      statusFlags = ((uint16_t)p[8] << 8) | p[9];
+      advFastMode = p[2] ? true : false;
+      captureBaselineFromCurrent();
+    }
+  } else {
+    y += 20;
+    tft.setCursor(10, y);
+    tft.print("No Manufacturer Data");
+  }
+  if (device.haveServiceData()) {
+    String serviceData = String((char*)device.getServiceData().c_str());
+    y += 30;
+    tft.setCursor(10, y);
+    tft.print("Service Data: " + serviceData);
+  } else {
+    y += 30;
+    tft.setCursor(10, y);
+    tft.print("No Service Data");
+  }
+
+  drawTabBar("Back", false, "", true, "Use", !hasSelectedTag2);
+}
+
+void runUI() {
+
+  static int iconY = STATUS_BAR_Y_OFFSET;
+
+  if (!uiDrawn) {
+    tft.drawLine(0, 19, 240, 19, WHITE);
+    tft.fillRect(0, STATUS_BAR_Y_OFFSET, SCREEN_WIDTH, STATUS_BAR_HEIGHT, DARK_GRAY);
+
+    for (int i = 0; i < ICON_NUM; i++) {
+      if (icons[i] != NULL) {
+        tft.drawBitmap(iconX[i], iconY, icons[i], ICON_SIZE, ICON_SIZE, TFT_WHITE);
+      }
+    }
+    tft.drawLine(0, STATUS_BAR_Y_OFFSET + STATUS_BAR_HEIGHT, SCREEN_WIDTH, STATUS_BAR_Y_OFFSET + STATUS_BAR_HEIGHT, ORANGE);
+    uiDrawn = true;
+  }
+  const bool inLoadedScanView = (showingLoadedProfiles && !isSendView && !isDetailView);
+  const bool saveEnabled = !inLoadedScanView;
+  const bool loadEnabled = !inLoadedScanView;
+  const bool showReset = isSendView;
+  const bool resetEnabled = isSendView;
+  static bool lastSaveEnabled = true;
+  static bool lastLoadEnabled = true;
+  static bool lastShowReset = false;
+  static bool lastResetEnabled = false;
+  if (saveEnabled != lastSaveEnabled || loadEnabled != lastLoadEnabled ||
+      showReset != lastShowReset || resetEnabled != lastResetEnabled) {
+    headerIconsDirty = true;
+    lastSaveEnabled = saveEnabled;
+    lastLoadEnabled = loadEnabled;
+    lastShowReset = showReset;
+    lastResetEnabled = resetEnabled;
+  }
+  if (headerIconsDirty || fullScreenUpdate) {
+    tft.fillRect(40, STATUS_BAR_Y_OFFSET, 56, 16, DARK_GRAY);
+    drawHeaderActionIcons(saveEnabled, loadEnabled, showReset, resetEnabled);
+    headerIconsDirty = false;
+  }
+
+  static unsigned long lastAnimationTime = 0;
+  static int animationState = 0;
+  static int activeIcon = -1;
+
+  if (animationState > 0 && millis() - lastAnimationTime >= 150) {
+    if (animationState == 1) {
+      tft.drawBitmap(iconX[activeIcon], iconY, icons[activeIcon], ICON_SIZE, ICON_SIZE, TFT_WHITE);
+      animationState = 2;
+
+      switch (activeIcon) {
+        case 0:
+          if (!isScanning) startBLEScan();
+          break;
+        case 1:
+           stopLiveScan();
+           feature_exit_requested = true;
+          break;
+      }
+    } else if (animationState == 2) {
+      animationState = 0;
+      activeIcon = -1;
+    }
+    lastAnimationTime = millis();
+  }
+
+  static unsigned long lastTouchCheck = 0;
+  const unsigned long touchCheckInterval = 120;
+  static uint32_t lastTouchActionMs = 0;
+
+  if (millis() - lastTouchCheck >= touchCheckInterval) {
+  int x, y;
+  if (feature_active && readTouchXY(x, y)) {
+      const uint32_t nowMs = millis();
+      if (nowMs - lastTouchActionMs < 250) {
+        lastTouchCheck = millis();
+        return;
+      }
+      if (y > STATUS_BAR_Y_OFFSET && y < STATUS_BAR_Y_OFFSET + STATUS_BAR_HEIGHT) {
+        // Confirm status-bar touch to reject noisy single-sample spikes.
+        int cx = 0, cy = 0;
+        delay(12);
+        if (!readTouchXY(cx, cy) || abs(cx - x) > 10 || abs(cy - y) > 10) {
+          lastTouchCheck = millis();
+          return;
+        }
+        if (x >= 40 && x <= 56) {
+          if (showingLoadedProfiles && !isSendView && !isDetailView) {
+            lastTouchCheck = millis();
+            return;
+          }
+          bool ok = false;
+          if (isSendView) ok = saveCurrentSendConfigToSd();
+          else ok = saveScanProfilesToSd();
+          uiHoldUntilMs = millis() + 1200;
+          showNotification("TAG2", ok ? "Config saved" : "Save failed");
+          lastTouchActionMs = nowMs;
+          screenNeedsUpdate = true;
+          return;
+        } else if (x >= 60 && x <= 76) {
+          if (inLoadedScanView) {
+            lastTouchCheck = millis();
+            return;
+          }
+          bool ok = false;
+          if (isSendView) {
+            // SEND: manual profile for current MAC, fallback to last manual save.
+            ok = loadProfileForMac(selectedMac, true);
+            if (!ok) ok = loadLastSendConfigFromSd();
+          } else {
+            // SCAN: only non-manual profiles.
+            ok = loadProfilesFromSdAsScan(true);
+            if (ok && !lastScanProfiles.empty()) {
+              // Replace current scan results with loaded profiles rendered as scan-like entries.
+              tag2Indices.clear();
+              rebuildLoadedProfileListFromCache();
+              showingLoadedProfiles = true;
+              current_page = 0;
+              currentIndex = 0;
+              listStartIndex = 0;
+              isDetailView = false;
+            }
+          }
+          uiHoldUntilMs = millis() + 1200;
+          showNotification("TAG2", ok ? "Config loaded" : "Load unavailable");
+          lastTouchActionMs = nowMs;
+          screenNeedsUpdate = true;
+          fullScreenUpdate = true;
+          return;
+        } else if (x >= 80 && x <= 96 && isSendView) {
+          bool restored = false;
+          auto it = lastScanProfiles.find(selectedMac);
+          if (it != lastScanProfiles.end() && it->second.valid) {
+            applyProfile(it->second);
+            restored = true;
+          }
+          if (!restored) restoreBaseline();
+          uiHoldUntilMs = millis() + 1200;
+          showNotification("TAG2", "Reset done");
+          lastTouchActionMs = nowMs;
+          screenNeedsUpdate = true;
+          return;
+        }
+        for (int i = 0; i < ICON_NUM; i++) {
+          if (x > iconX[i] && x < iconX[i] + ICON_SIZE) {
+            if (icons[i] != NULL && animationState == 0) {
+              tft.drawBitmap(iconX[i], iconY, icons[i], ICON_SIZE, ICON_SIZE, TFT_BLACK);
+              animationState = 1;
+              activeIcon = i;
+              lastAnimationTime = millis();
+              lastTouchActionMs = nowMs;
+            }
+            break;
+          }
+        }
+      } else if (!isScanning) {
+        if (isSendView) {
+          // Last row controls in SEND: BACK, MODE, PW ON/OFF.
+          if (y >= 304 && y <= 320) {
+            if (x >= 0 && x <= 57) {
+              isSendView = false;
+              isDetailView = false;
+              screenNeedsUpdate = true;
+              fullScreenUpdate = true;
+              lastTouchActionMs = nowMs;
+            } else if (x >= 60 && x <= 117) {
+              advFastMode = !advFastMode;
+              applySendToAdvertiser();
+              screenNeedsUpdate = true;
+              lastTouchActionMs = nowMs;
+            } else if (x >= 177 && x <= 234) {
+              advEnabled = !advEnabled;
+              applySendToAdvertiser();
+              screenNeedsUpdate = true;
+              lastTouchActionMs = nowMs;
+            }
+          } else if (y >= 102 && y < 102 + 5 * 22) {
+            selectedField = (y - 102) / 22;
+            screenNeedsUpdate = true;
+            lastTouchActionMs = nowMs;
+            // Per-row tiny buttons: -, +, 0; Batt row has M (max 100).
+            if (x >= 146 && x <= 222) {
+              const int row = (y - 102) / 22;
+              if (row >= 0 && row < 5) {
+                if (x >= 146 && x <= 162) { // minus
+                  if (row == 0 && fastHours > 0) fastHours--;
+                  else if (row == 1 && slowHours > 0) slowHours--;
+                  else if (row == 2 && connAttempts > 0) connAttempts--;
+                  else if (row == 3 && buttonPresses > 0) buttonPresses--;
+                  else if (row == 4) {
+                    int b = (int)batteryLevel - batteryStepWithJitter();
+                    batteryLevel = (uint8_t)constrain(b, 0, 100);
+                  }
+                } else if (x >= 164 && x <= 180) { // plus
+                  if (row == 0 && fastHours < 255) fastHours++;
+                  else if (row == 1 && slowHours < 65535) slowHours++;
+                  else if (row == 2 && connAttempts < 255) connAttempts++;
+                  else if (row == 3 && buttonPresses < 255) buttonPresses++;
+                  else if (row == 4) {
+                    int b = (int)batteryLevel + batteryStepWithJitter();
+                    batteryLevel = (uint8_t)constrain(b, 0, 100);
+                  }
+                } else if (x >= 186 && x <= 202) { // reset literal to 0 (only non-battery rows)
+                  if (row == 0) fastHours = 0;
+                  else if (row == 1) slowHours = 0;
+                  else if (row == 2) connAttempts = 0;
+                  else if (row == 3) buttonPresses = 0;
+                } else if (row == 4 && x >= 204 && x <= 222) { // MAX
+                  batteryLevel = 100;
+                }
+                applySendToAdvertiser();
+                screenNeedsUpdate = true;
+              }
+            }
+          }
+        } else {
+          const int deviceCount = filteredCount();
+
+          // Deauther-like bottom bar has a large touch hitbox.
+          if (y >= 290 && y <= 320) {
+            const bool prevDisabled = (current_page == 0);
+            const bool nextDisabled = ((current_page + 1) * DEVICES_PER_PAGE >= deviceCount);
+
+            if (x >= 0 && x <= 57) {
+              if (isDetailView) {
+                // Back (left) in detail view.
+                isDetailView = false;
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              } else {
+                drawButton(0, 304, 57, 16, "Rescan", true, false);
+                delay(50);
+                startBLEScan();
+                lastTouchActionMs = nowMs;
+              }
+            } else if (x >= 117 && x <= 179 && !isDetailView && !prevDisabled) {
+              drawButton(117, 304, 57, 16, "Prev", true, false);
+              current_page--;
+              if (current_page < 0) current_page = 0;
+              currentIndex = current_page * DEVICES_PER_PAGE;
+              listStartIndex = current_page * DEVICES_PER_PAGE;
+              screenNeedsUpdate = true;
+              fullScreenUpdate = true;
+              lastTouchActionMs = nowMs;
+            } else if (x >= 177 && x <= 240) {
+              if (isDetailView) {
+                // Use (right) in detail view.
+                drawButton(177, 304, 57, 16, "Use", true, !hasSelectedTag2);
+                if (hasSelectedTag2) {
+                  isSendView = true;
+                  isDetailView = false;
+                  applySendToAdvertiser();
+                }
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              } else if (!nextDisabled) {
+                drawButton(177, 304, 57, 16, "Next", true, false);
+                current_page++;
+                currentIndex = current_page * DEVICES_PER_PAGE;
+                listStartIndex = current_page * DEVICES_PER_PAGE;
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              }
+            }
+          } else if (!isDetailView) {
+            // Distance model controls in scan list header.
+            if (!showingLoadedProfiles && y >= 62 && y <= 76) {
+              if (x >= 24 && x <= 40) {
+                if (distanceTxPowerAt1m > -100) distanceTxPowerAt1m--;
+                saveRfModelToSd();
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              } else if (x >= 42 && x <= 58) {
+                if (distanceTxPowerAt1m < -20) distanceTxPowerAt1m++;
+                saveRfModelToSd();
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              } else if (x >= 132 && x <= 148) {
+                if (distanceN_x10 > 10) distanceN_x10--;
+                saveRfModelToSd();
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              } else if (x >= 150 && x <= 166) {
+                if (distanceN_x10 < 40) distanceN_x10++;
+                saveRfModelToSd();
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              }
+            }
+            const int listMaxY = LIST_FIRST_ROW_Y + (DEVICES_PER_PAGE * LIST_ROW_H);
+            if (deviceCount > 0 && y >= LIST_FIRST_ROW_Y && y < listMaxY) {
+              const int row = (y - LIST_FIRST_ROW_Y) / LIST_ROW_H;
+              const int idx = (current_page * DEVICES_PER_PAGE) + row;
+              if (idx >= 0 && idx < deviceCount) {
+                currentIndex = idx;
+                isDetailView = true;
+                screenNeedsUpdate = true;
+                fullScreenUpdate = true;
+                lastTouchActionMs = nowMs;
+              }
+            }
+          }
+        }
+      }
+    }
+    lastTouchCheck = millis();
+  }
+}
+
+void bleScanSetup() {
+
+  tft.fillScreen(TFT_BLACK);
+
+  uiDrawn = false;
+
+  float currentBatteryVoltage = readBatteryVoltage();
+  drawStatusBar(currentBatteryVoltage, true);
+  runUI();
+
+  setupTouchscreen();
+  loadRfModelFromSd();
+
+  pcf.pinMode(BTN_UP, INPUT_PULLUP);
+  pcf.pinMode(BTN_DOWN, INPUT_PULLUP);
+  pcf.pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
+
+  ensureBleInit();
+  rebuildTag2Index();
+
+  if (bgHasResults && filteredCount() > 0) {
+    current_page = 0;
+    currentIndex = 0;
+    listStartIndex = 0;
+    isDetailView = false;
+    screenNeedsUpdate = true;
+    fullScreenUpdate = true;
+    updateBLEList();
+  } else {
+    startBLEScan();
+  }
+}
+
+void bleScanLoop() {
+
+  if (feature_active && isButtonPressed(BTN_SELECT)) {
+    stopLiveScan();
+    if (tag2Adv) tag2Adv->stop();
+    advEnabled = false;
+    feature_exit_requested = true;
+    return;
+  }
+
+  tft.drawLine(0, 19, 240, 19, WHITE);
+  handleButtons();
+
+  updateStatusBar();
+  runUI();
+
+  if (screenNeedsUpdate) {
+    screenNeedsUpdate = false;
+    if (isSendView) {
+      drawSendView();
+    } else if (!isDetailView) {
+      updateBLEList();
+    } else {
+      displayBLEDetails();
+    }
+    if (fullScreenUpdate) fullScreenUpdate = false;
+  }
+}
+
+void startBackgroundScanner() {
+  if (bgBleScanTaskHandle != nullptr) return;
+  xTaskCreatePinnedToCore(
+    bgBleScanTask,
+    "bgBleScan",
+    4096,
+    nullptr,
+    1,
+    &bgBleScanTaskHandle,
+    0
+  );
+}
+
+int getLastCount() {
+
+  if (!settings().autoBleScan) return 0;
+  return filteredCount();
+}
+
+void exit() {
+
+  stopLiveScan();
+  if (tag2Adv) tag2Adv->stop();
+  advEnabled = false;
+  if (isScanning && bleScan) {
+    bleScan->stop();
+    isScanning = false;
+  }
+}
+}
+
 
 namespace Scanner {
 

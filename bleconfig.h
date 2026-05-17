@@ -38,9 +38,16 @@ namespace SourApple {
 namespace BleScan {
   void bleScanSetup();
   void bleScanLoop();
+  void exit();
 
   void startBackgroundScanner();
   int  getLastCount();
+}
+
+namespace BleTag2 {
+  void bleScanSetup();
+  void bleScanLoop();
+  void exit();
 }
 
 namespace Scanner {
