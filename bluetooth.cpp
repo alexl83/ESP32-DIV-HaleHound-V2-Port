@@ -1798,6 +1798,10 @@ static uint16_t statusFlags = 0x0001;
 static BLEAdvertising* tag2Adv = nullptr;
 static unsigned long lastAdvPulseMs = 0;
 static int selectedField = 0; // 0=F 1=S 2=C 3=B 4=BAT
+static bool resetCooldownActive = false;
+static uint32_t resetCooldownResumeMs = 0;
+static int lastResetCountdownShown = -1;
+static uint32_t resetCooldownLastUiMs = 0;
 static bool baselineValid = false;
 static String baselineMac = "C0:FF:EE:C0:DE:01";
 static bool baselineFastMode = true;
@@ -1849,6 +1853,36 @@ static inline void markGuiIncrementEventFlag() {
   if ((statusFlags & TAG2_APP_FLAG_GUI_INCREMENT) == 0) {
     statusFlags |= TAG2_APP_FLAG_GUI_INCREMENT;
   }
+}
+
+static void resetSendPayloadParamsKeepBattery() {
+  const uint8_t keepBattery = batteryLevel;
+  buttonPresses = 0;
+  advFastMode = true;
+  fastHours = 0;
+  slowHours = 0;
+  connAttempts = 0;
+  connectionStateCode = 0;
+  statusFlags = 0;
+  batteryLevel = keepBattery;
+}
+
+static void drawResetCountdownOverlay() {
+  const int areaX = 116;
+  const int areaY = 290;
+  const int areaW = 66;
+  const int areaH = 11;
+  tft.fillRect(areaX, areaY, areaW, areaH, TFT_BLACK);
+  if (!resetCooldownActive) return;
+  const int32_t leftMs = (int32_t)(resetCooldownResumeMs - millis());
+  char leftBuf[20];
+  snprintf(leftBuf, sizeof(leftBuf), "Off: %lds", (long)max(0, (leftMs + 999) / 1000));
+  tft.setTextColor(ORANGE, TFT_BLACK);
+  const int txtW = tft.textWidth(leftBuf);
+  const int rstCenterX = 120 + (57 / 2);
+  const int txtX = rstCenterX - (txtW / 2);
+  tft.setCursor(txtX, 292);
+  tft.print(leftBuf);
 }
 
 static void drawHeaderActionIcons(bool saveEnabled, bool loadEnabled, bool showReset, bool resetEnabled) {
@@ -2401,7 +2435,7 @@ static void applySendToAdvertiser() {
                 (unsigned)rawLen,
                 customRndOk ? "RANDOM(custom)" : "RANDOM(failed)");
 
-  if (advEnabled) {
+  if (advEnabled && !resetCooldownActive) {
     bool ok = tag2Adv->start();
     Serial.printf("[TAG2] ADV start returned=%d\n", ok ? 1 : 0);
   }
@@ -2436,11 +2470,14 @@ static void drawSendView() {
     if (i == 4) drawButton(204, y - 2, 18, 14, "M", false, false);
   }
 
-  // Last row: BACK + MODE on left, PW ON/OFF on right.
+  // Last row: BACK + MODE + Rst + PW ON/OFF.
   tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
   drawButton(0, 304, 57, 16, "Back", false, false);
   drawButton(60, 304, 57, 16, "Mode", false, false);
+  drawButton(120, 304, 57, 16, "Rst", false, false);
   drawButton(177, 304, 57, 16, advEnabled ? "On" : "Off", false, false);
+
+  drawResetCountdownOverlay();
 }
 
 static void ensureBleInit() {
@@ -3023,7 +3060,7 @@ void runUI() {
         }
       } else if (!isScanning) {
         if (isSendView) {
-          // Last row controls in SEND: BACK, MODE, PW ON/OFF.
+          // Last row controls in SEND: BACK, MODE, Rst, PW ON/OFF.
           if (y >= 304 && y <= 320) {
             if (x >= 0 && x <= 57) {
               isSendView = false;
@@ -3035,6 +3072,22 @@ void runUI() {
               advFastMode = !advFastMode;
               applySendToAdvertiser();
               screenNeedsUpdate = true;
+              lastTouchActionMs = nowMs;
+            } else if (x >= 120 && x <= 177) {
+              resetSendPayloadParamsKeepBattery();
+              if (advEnabled) {
+                if (tag2Adv) tag2Adv->stop();
+                resetCooldownActive = true;
+                resetCooldownResumeMs = millis() + 10000;
+                resetCooldownLastUiMs = 0;
+                lastResetCountdownShown = -1;
+                showNotification("TAG2", "Beacon OFF 10s");
+              } else {
+                applySendToAdvertiser();
+                showNotification("TAG2", "Params reset");
+              }
+              screenNeedsUpdate = true;
+              fullScreenUpdate = true;
               lastTouchActionMs = nowMs;
             } else if (x >= 177 && x <= 234) {
               advEnabled = !advEnabled;
@@ -3215,6 +3268,26 @@ void bleScanSetup() {
 }
 
 void bleScanLoop() {
+  if (resetCooldownActive && (millis() - resetCooldownLastUiMs) >= 200) {
+    resetCooldownLastUiMs = millis();
+    const int32_t leftMs = (int32_t)(resetCooldownResumeMs - millis());
+    const int leftSec = max(0, (int)((leftMs + 999) / 1000));
+    if (leftSec != lastResetCountdownShown && isSendView) {
+      lastResetCountdownShown = leftSec;
+      drawResetCountdownOverlay();
+    }
+  }
+  if (resetCooldownActive && (int32_t)(millis() - resetCooldownResumeMs) >= 0) {
+    resetCooldownActive = false;
+    resetCooldownLastUiMs = 0;
+    lastResetCountdownShown = -1;
+    if (advEnabled) {
+      applySendToAdvertiser();
+      showNotification("TAG2", "Beacon resumed");
+    }
+    if (isSendView) drawResetCountdownOverlay();
+    screenNeedsUpdate = true;
+  }
 
   if (feature_active && isButtonPressed(BTN_SELECT)) {
     stopLiveScan();
