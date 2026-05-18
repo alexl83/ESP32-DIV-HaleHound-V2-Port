@@ -1788,7 +1788,7 @@ static uint8_t selectedPayload[10] = {19, 100, 1, 14, 0, 86, 0, 12, 0, 1};
 static String selectedMac = "C0:FF:EE:C0:DE:01";
 static bool advEnabled = false;
 static bool advFastMode = true;
-static uint8_t fastHours = 14;
+static uint16_t fastHours = 14;
 static uint16_t slowHours = 86;
 static uint8_t connAttempts = 12;
 static uint8_t buttonPresses = 19;
@@ -1801,7 +1801,7 @@ static int selectedField = 0; // 0=F 1=S 2=C 3=B 4=BAT
 static bool baselineValid = false;
 static String baselineMac = "C0:FF:EE:C0:DE:01";
 static bool baselineFastMode = true;
-static uint8_t baselineFastHours = 14;
+static uint16_t baselineFastHours = 14;
 static uint16_t baselineSlowHours = 86;
 static uint8_t baselineConnAttempts = 12;
 static uint8_t baselineButtonPresses = 19;
@@ -1819,7 +1819,7 @@ struct Tag2Profile {
   bool manualSave = false;
   String mac = "";
   bool mode = true;
-  uint8_t fast_h = 14;
+  uint16_t fast_h = 14;
   uint16_t slow_h = 86;
   uint8_t conn = 12;
   uint8_t btn = 19;
@@ -1835,6 +1835,7 @@ static volatile bool liveScanStopReq = false;
 static volatile uint32_t liveScanLastUpdateMs = 0;
 static volatile uint32_t liveResultsVersion = 0;
 static volatile uint32_t uiHoldUntilMs = 0;
+static constexpr uint16_t TAG2_APP_FLAG_GUI_INCREMENT = 0x0001; // payload byte[9] bit0
 
 static int iconX[ICON_NUM] = {220, 10};
 static const unsigned char* icons[ICON_NUM] = {
@@ -1843,6 +1844,12 @@ static const unsigned char* icons[ICON_NUM] = {
 };
 static void applySendToAdvertiser();
 static bool saveProfileToSd(const Tag2Profile& p, bool updateLastPath);
+static inline void markGuiIncrementEventFlag() {
+  // New decoder format: set app flag bit0 (payload offset 9, LSB) when GUI increments a field.
+  if ((statusFlags & TAG2_APP_FLAG_GUI_INCREMENT) == 0) {
+    statusFlags |= TAG2_APP_FLAG_GUI_INCREMENT;
+  }
+}
 
 static void drawHeaderActionIcons(bool saveEnabled, bool loadEnabled, bool showReset, bool resetEnabled) {
   // Compact status-bar icons, aligned with native toolbar style.
@@ -2100,7 +2107,7 @@ static bool parseProfileFromJson(const String& all, Tag2Profile& p) {
   if (jsonGetString(all, "mac", mac)) p.mac = mac;
   if (jsonGetInt(all, "manual_save", v)) p.manualSave = (v != 0);
   if (jsonGetInt(all, "mode", v)) p.mode = (v != 0);
-  if (jsonGetInt(all, "fast_h", v)) p.fast_h = (uint8_t)constrain(v, 0, 255);
+  if (jsonGetInt(all, "fast_h", v)) p.fast_h = (uint16_t)constrain(v, 0, 65535);
   if (jsonGetInt(all, "slow_h", v)) p.slow_h = (uint16_t)constrain(v, 0, 65535);
   if (jsonGetInt(all, "conn", v)) p.conn = (uint8_t)constrain(v, 0, 255);
   if (jsonGetInt(all, "btn", v)) p.btn = (uint8_t)constrain(v, 0, 255);
@@ -2186,7 +2193,7 @@ static bool loadConfigFromPath(const String& cfgPath) {
     int v = 0;
     if (jsonGetString(all, "mac", mac)) selectedMac = mac;
     if (jsonGetInt(all, "mode", v)) advFastMode = (v != 0);
-    if (jsonGetInt(all, "fast_h", v)) fastHours = (uint8_t)constrain(v, 0, 255);
+    if (jsonGetInt(all, "fast_h", v)) fastHours = (uint16_t)constrain(v, 0, 65535);
     if (jsonGetInt(all, "slow_h", v)) slowHours = (uint16_t)constrain(v, 0, 65535);
     if (jsonGetInt(all, "conn", v)) connAttempts = (uint8_t)constrain(v, 0, 255);
     if (jsonGetInt(all, "btn", v)) buttonPresses = (uint8_t)constrain(v, 0, 255);
@@ -2211,7 +2218,7 @@ static bool loadConfigFromPath(const String& cfgPath) {
       vv.trim();
       if (k == "mac") selectedMac = vv;
       else if (k == "mode") advFastMode = (vv.toInt() != 0);
-      else if (k == "fast_h") fastHours = (uint8_t)constrain(vv.toInt(), 0, 255);
+      else if (k == "fast_h") fastHours = (uint16_t)constrain(vv.toInt(), 0, 65535);
       else if (k == "slow_h") slowHours = (uint16_t)constrain(vv.toInt(), 0, 65535);
       else if (k == "conn") connAttempts = (uint8_t)constrain(vv.toInt(), 0, 255);
       else if (k == "btn") buttonPresses = (uint8_t)constrain(vv.toInt(), 0, 255);
@@ -2322,13 +2329,15 @@ static bool parseMacToBytes(const String& mac, uint8_t out[6]) {
 static void buildTag2AdvRaw(uint8_t out[31], uint8_t& outLen) {
   memset(out, 0, 31);
   uint8_t p[10];
+  // Final format:
+  // [0]BTN [1]BAT [2]ADV_MODE [3..4]FAST_H_LE [5..6]SLOW_H_LE [7]CONN_CNT [8..9]APP_FLAGS_BE
   p[0] = buttonPresses;
   p[1] = batteryLevel;
   p[2] = advFastMode ? 1 : 0;
-  p[3] = fastHours;
-  p[4] = (uint8_t)(slowHours >> 8);
+  p[3] = (uint8_t)(fastHours & 0xFF);
+  p[4] = (uint8_t)((fastHours >> 8) & 0xFF);
   p[5] = (uint8_t)(slowHours & 0xFF);
-  p[6] = connectionStateCode;
+  p[6] = (uint8_t)((slowHours >> 8) & 0xFF);
   p[7] = connAttempts;
   p[8] = (uint8_t)(statusFlags >> 8);
   p[9] = (uint8_t)(statusFlags & 0xFF);
@@ -2453,9 +2462,9 @@ static void cacheProfilesFromCurrentResults() {
     tp.manualSave = false;
     tp.mac = String(d.getAddress().toString().c_str());
     tp.mode = p[2] ? true : false;
-    tp.fast_h = p[3];
-    tp.slow_h = ((uint16_t)p[4] << 8) | p[5];
-    tp.state = p[6];
+    tp.fast_h = ((uint16_t)p[4] << 8) | p[3];
+    tp.slow_h = ((uint16_t)p[6] << 8) | p[5];
+    tp.state = connectionStateCode;
     tp.conn = p[7];
     tp.flags = ((uint16_t)p[8] << 8) | p[9];
     tp.btn = p[0];
@@ -2833,9 +2842,8 @@ void displayBLEDetails() {
       selectedMac = address;
       buttonPresses = p[0];
       batteryLevel = (uint8_t)constrain((int)p[1], 0, 100);
-      fastHours = p[3];
-      slowHours = ((uint16_t)p[4] << 8) | p[5];
-      connectionStateCode = p[6];
+      fastHours = ((uint16_t)p[4] << 8) | p[3];
+      slowHours = ((uint16_t)p[6] << 8) | p[5];
       connAttempts = p[7];
       statusFlags = ((uint16_t)p[8] << 8) | p[9];
       advFastMode = p[2] ? true : false;
@@ -3052,10 +3060,10 @@ void runUI() {
                     batteryLevel = (uint8_t)constrain(b, 0, 100);
                   }
                 } else if (x >= 164 && x <= 180) { // plus
-                  if (row == 0 && fastHours < 255) fastHours++;
+                  if (row == 0 && fastHours < 65535) fastHours++;
                   else if (row == 1 && slowHours < 65535) slowHours++;
                   else if (row == 2 && connAttempts < 255) connAttempts++;
-                  else if (row == 3 && buttonPresses < 255) buttonPresses++;
+                  else if (row == 3 && buttonPresses < 255) { buttonPresses++; markGuiIncrementEventFlag(); }
                   else if (row == 4) {
                     int b = (int)batteryLevel + batteryStepWithJitter();
                     batteryLevel = (uint8_t)constrain(b, 0, 100);
@@ -3064,7 +3072,11 @@ void runUI() {
                   if (row == 0) fastHours = 0;
                   else if (row == 1) slowHours = 0;
                   else if (row == 2) connAttempts = 0;
-                  else if (row == 3) buttonPresses = 0;
+                  else if (row == 3) {
+                    buttonPresses = 0;
+                    // Requested behavior: resetting button counter clears payload offset 9 bit0.
+                    statusFlags &= (uint16_t)~TAG2_APP_FLAG_GUI_INCREMENT;
+                  }
                 } else if (row == 4 && x >= 204 && x <= 222) { // MAX
                   batteryLevel = 100;
                 }
