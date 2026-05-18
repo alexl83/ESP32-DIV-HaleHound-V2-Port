@@ -5026,6 +5026,7 @@ private:
   unsigned long lastMaxDevicesWarningTime = 0;
   bool scanning = true;
   bool isBLEScanActive = true;
+  bool pendingBleRestart = false;
   unsigned long lastScanTime = 0;
   unsigned long lastFlashToggle = 0;
   bool flashState = false;
@@ -5403,6 +5404,8 @@ void runUI() {
             }
             refreshDisplay();
             addLine("Device list reset", DARK_GRAY, true, MessageType::STATUS);
+            // Defer scanner restart to main loop context (safer than restarting inside UI callback).
+            pendingBleRestart = true;
           break;
         case 1:
            filterSuspicious();
@@ -5493,6 +5496,16 @@ public:
     }
     updateStatusBar();
     cleanupDevices(now);
+
+    if (pendingBleRestart) {
+      pendingBleRestart = false;
+      if (pBLEScan) pBLEScan->stop();
+      isBLEScanActive = true;
+      startBLEScan();
+      lastScanTime = millis();
+      return;
+    }
+
     if (scanning && now - lastScanTime >= SCAN_INTERVAL) {
       if (isBLEScanActive) {
         pBLEScan->stop();
