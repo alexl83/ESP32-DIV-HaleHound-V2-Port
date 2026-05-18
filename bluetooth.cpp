@@ -17,7 +17,6 @@
 #include <vector>
 #include <map>
 
-
 #ifdef TFT_BLACK
 #undef TFT_BLACK
 #endif
@@ -1248,11 +1247,26 @@ static void drawTabBar(const char* leftButton, bool leftDisabled,
 
 static TaskHandle_t bgBleScanTaskHandle = nullptr;
 static volatile bool bgHasResults = false;
+static volatile bool bgPauseReq = false;
+static volatile bool bgScanActive = false;
 static volatile uint32_t bgLastScanMs = 0;
 static const uint32_t BG_BLE_SCAN_INTERVAL_MS = 15000;
 static bool bleInitDone = false;
 static const uint32_t BG_BOOT_GRACE_MS = 6000;
 static uint32_t bgBootMs = 0;
+
+static void quiesceBleScan() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (adv) {
+    adv->stop();
+    delay(30);
+  }
+  if (!bleScan) return;
+  bleScan->stop();
+  delay(30);
+  bleScan->clearResults();
+  delay(10);
+}
 
 static void ensureBleInit() {
   if (bleInitDone) return;
@@ -1265,14 +1279,22 @@ static void ensureBleInit() {
 static void bgBleScanTask(void* ) {
   ensureBleInit();
   for (;;) {
+    if (bgPauseReq) {
+      if (bleScan) bleScan->stop();
+      bgScanActive = false;
+      vTaskDelay(120 / portTICK_PERIOD_MS);
+      continue;
+    }
     const uint32_t now = millis();
     if (bgBootMs == 0) bgBootMs = now;
 
     const bool idleOk = (now - bgBootMs) > BG_BOOT_GRACE_MS;
     if (settings().autoBleScan && idleOk && !feature_active && !in_sub_menu) {
       isScanning = true;
-
+      bgScanActive = true;
+      bleScan->clearResults();
       bleResults = bleScan->start(2, false);
+      bgScanActive = false;
       isScanning = false;
       if (bleResults.getCount() >= 0) {
         bgHasResults = (bleResults.getCount() > 0);
@@ -1314,6 +1336,7 @@ void startBLEScan() {
   screenNeedsUpdate = true;
   fullScreenUpdate = true;
   ensureBleInit();
+  bleScan->clearResults();
   bleResults = bleScan->start(5, false);
   isScanning = false;
   screenNeedsUpdate = true;
@@ -1670,18 +1693,12 @@ void bleScanSetup() {
   pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
 
   ensureBleInit();
+  quiesceBleScan();
 
-  if (bgHasResults && bleResults.getCount() > 0) {
-    current_page = 0;
-    currentIndex = 0;
-    listStartIndex = 0;
-    isDetailView = false;
-    screenNeedsUpdate = true;
-    fullScreenUpdate = true;
-    updateBLEList();
-  } else {
-    startBLEScan();
-  }
+  // Do not reuse cached BLE results across tool transitions:
+  // stale result objects can trigger heap-heavy copies in getDevice().
+  bgHasResults = false;
+  startBLEScan();
 }
 
 void bleScanLoop() {
@@ -1711,16 +1728,9 @@ void bleScanLoop() {
 }
 
 void startBackgroundScanner() {
-  if (bgBleScanTaskHandle != nullptr) return;
-  xTaskCreatePinnedToCore(
-    bgBleScanTask,
-    "bgBleScan",
-    4096,
-    nullptr,
-    1,
-    &bgBleScanTaskHandle,
-    0
-  );
+  // Disabled for stability on ESP32-DIV V2:
+  // concurrent background scans caused cross-tool BLE reboots.
+  bgBleScanTaskHandle = nullptr;
 }
 
 int getLastCount() {
@@ -1731,10 +1741,9 @@ int getLastCount() {
 
 void exit() {
 
-  if (isScanning && bleScan) {
-    bleScan->stop();
-    isScanning = false;
-  }
+  if (isScanning) isScanning = false;
+  quiesceBleScan();
+  bgHasResults = false;
 }
 }
 
@@ -1779,7 +1788,7 @@ static uint8_t selectedPayload[10] = {19, 100, 1, 14, 0, 86, 0, 12, 0, 1};
 static String selectedMac = "C0:FF:EE:C0:DE:01";
 static bool advEnabled = false;
 static bool advFastMode = true;
-static uint8_t fastHours = 14;
+static uint16_t fastHours = 14;
 static uint16_t slowHours = 86;
 static uint8_t connAttempts = 12;
 static uint8_t buttonPresses = 19;
@@ -1789,10 +1798,14 @@ static uint16_t statusFlags = 0x0001;
 static BLEAdvertising* tag2Adv = nullptr;
 static unsigned long lastAdvPulseMs = 0;
 static int selectedField = 0; // 0=F 1=S 2=C 3=B 4=BAT
+static bool resetCooldownActive = false;
+static uint32_t resetCooldownResumeMs = 0;
+static int lastResetCountdownShown = -1;
+static uint32_t resetCooldownLastUiMs = 0;
 static bool baselineValid = false;
 static String baselineMac = "C0:FF:EE:C0:DE:01";
 static bool baselineFastMode = true;
-static uint8_t baselineFastHours = 14;
+static uint16_t baselineFastHours = 14;
 static uint16_t baselineSlowHours = 86;
 static uint8_t baselineConnAttempts = 12;
 static uint8_t baselineButtonPresses = 19;
@@ -1810,7 +1823,7 @@ struct Tag2Profile {
   bool manualSave = false;
   String mac = "";
   bool mode = true;
-  uint8_t fast_h = 14;
+  uint16_t fast_h = 14;
   uint16_t slow_h = 86;
   uint8_t conn = 12;
   uint8_t btn = 19;
@@ -1826,6 +1839,7 @@ static volatile bool liveScanStopReq = false;
 static volatile uint32_t liveScanLastUpdateMs = 0;
 static volatile uint32_t liveResultsVersion = 0;
 static volatile uint32_t uiHoldUntilMs = 0;
+static constexpr uint16_t TAG2_APP_FLAG_GUI_INCREMENT = 0x0001; // payload byte[9] bit0
 
 static int iconX[ICON_NUM] = {220, 10};
 static const unsigned char* icons[ICON_NUM] = {
@@ -1834,6 +1848,42 @@ static const unsigned char* icons[ICON_NUM] = {
 };
 static void applySendToAdvertiser();
 static bool saveProfileToSd(const Tag2Profile& p, bool updateLastPath);
+static inline void markGuiIncrementEventFlag() {
+  // New decoder format: set app flag bit0 (payload offset 9, LSB) when GUI increments a field.
+  if ((statusFlags & TAG2_APP_FLAG_GUI_INCREMENT) == 0) {
+    statusFlags |= TAG2_APP_FLAG_GUI_INCREMENT;
+  }
+}
+
+static void resetSendPayloadParamsKeepBattery() {
+  const uint8_t keepBattery = batteryLevel;
+  buttonPresses = 0;
+  advFastMode = true;
+  fastHours = 0;
+  slowHours = 0;
+  connAttempts = 0;
+  connectionStateCode = 0;
+  statusFlags = 0;
+  batteryLevel = keepBattery;
+}
+
+static void drawResetCountdownOverlay() {
+  const int areaX = 116;
+  const int areaY = 290;
+  const int areaW = 66;
+  const int areaH = 11;
+  tft.fillRect(areaX, areaY, areaW, areaH, TFT_BLACK);
+  if (!resetCooldownActive) return;
+  const int32_t leftMs = (int32_t)(resetCooldownResumeMs - millis());
+  char leftBuf[20];
+  snprintf(leftBuf, sizeof(leftBuf), "Off: %lds", (long)max(0, (leftMs + 999) / 1000));
+  tft.setTextColor(ORANGE, TFT_BLACK);
+  const int txtW = tft.textWidth(leftBuf);
+  const int rstCenterX = 120 + (57 / 2);
+  const int txtX = rstCenterX - (txtW / 2);
+  tft.setCursor(txtX, 292);
+  tft.print(leftBuf);
+}
 
 static void drawHeaderActionIcons(bool saveEnabled, bool loadEnabled, bool showReset, bool resetEnabled) {
   // Compact status-bar icons, aligned with native toolbar style.
@@ -1867,11 +1917,26 @@ static void drawTabBar(const char* leftButton, bool leftDisabled,
 
 static TaskHandle_t bgBleScanTaskHandle = nullptr;
 static volatile bool bgHasResults = false;
+static volatile bool bgPauseReq = false;
+static volatile bool bgScanActive = false;
 static volatile uint32_t bgLastScanMs = 0;
 static const uint32_t BG_BLE_SCAN_INTERVAL_MS = 15000;
 static bool bleInitDone = false;
 static const uint32_t BG_BOOT_GRACE_MS = 6000;
 static uint32_t bgBootMs = 0;
+
+static void quiesceBleScan() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (adv) {
+    adv->stop();
+    delay(30);
+  }
+  if (!bleScan) return;
+  bleScan->stop();
+  delay(30);
+  bleScan->clearResults();
+  delay(10);
+}
 static std::vector<int> tag2Indices;
 static std::vector<Tag2Profile> loadedProfileList;
 static bool showingLoadedProfiles = false;
@@ -1891,18 +1956,14 @@ static bool parseTag2Payload(BLEAdvertisedDevice& device, uint8_t out[10]) {
 static void rebuildTag2Index() {
   tag2Indices.clear();
   const int total = bleResults.getCount();
-  for (int i = 0; i < total; i++) {
+  const int cap = min(total, 96);  // avoid heap spikes on huge result sets
+  for (int i = 0; i < cap; i++) {
     BLEAdvertisedDevice d = bleResults.getDevice(i);
     uint8_t p[10];
     if (parseTag2Payload(d, p)) {
       tag2Indices.push_back(i);
     }
   }
-  std::sort(tag2Indices.begin(), tag2Indices.end(), [](int a, int b) {
-    BLEAdvertisedDevice da = bleResults.getDevice(a);
-    BLEAdvertisedDevice db = bleResults.getDevice(b);
-    return da.getRSSI() > db.getRSSI();
-  });
 }
 
 static int filteredCount() {
@@ -2080,7 +2141,7 @@ static bool parseProfileFromJson(const String& all, Tag2Profile& p) {
   if (jsonGetString(all, "mac", mac)) p.mac = mac;
   if (jsonGetInt(all, "manual_save", v)) p.manualSave = (v != 0);
   if (jsonGetInt(all, "mode", v)) p.mode = (v != 0);
-  if (jsonGetInt(all, "fast_h", v)) p.fast_h = (uint8_t)constrain(v, 0, 255);
+  if (jsonGetInt(all, "fast_h", v)) p.fast_h = (uint16_t)constrain(v, 0, 65535);
   if (jsonGetInt(all, "slow_h", v)) p.slow_h = (uint16_t)constrain(v, 0, 65535);
   if (jsonGetInt(all, "conn", v)) p.conn = (uint8_t)constrain(v, 0, 255);
   if (jsonGetInt(all, "btn", v)) p.btn = (uint8_t)constrain(v, 0, 255);
@@ -2166,7 +2227,7 @@ static bool loadConfigFromPath(const String& cfgPath) {
     int v = 0;
     if (jsonGetString(all, "mac", mac)) selectedMac = mac;
     if (jsonGetInt(all, "mode", v)) advFastMode = (v != 0);
-    if (jsonGetInt(all, "fast_h", v)) fastHours = (uint8_t)constrain(v, 0, 255);
+    if (jsonGetInt(all, "fast_h", v)) fastHours = (uint16_t)constrain(v, 0, 65535);
     if (jsonGetInt(all, "slow_h", v)) slowHours = (uint16_t)constrain(v, 0, 65535);
     if (jsonGetInt(all, "conn", v)) connAttempts = (uint8_t)constrain(v, 0, 255);
     if (jsonGetInt(all, "btn", v)) buttonPresses = (uint8_t)constrain(v, 0, 255);
@@ -2191,7 +2252,7 @@ static bool loadConfigFromPath(const String& cfgPath) {
       vv.trim();
       if (k == "mac") selectedMac = vv;
       else if (k == "mode") advFastMode = (vv.toInt() != 0);
-      else if (k == "fast_h") fastHours = (uint8_t)constrain(vv.toInt(), 0, 255);
+      else if (k == "fast_h") fastHours = (uint16_t)constrain(vv.toInt(), 0, 65535);
       else if (k == "slow_h") slowHours = (uint16_t)constrain(vv.toInt(), 0, 65535);
       else if (k == "conn") connAttempts = (uint8_t)constrain(vv.toInt(), 0, 255);
       else if (k == "btn") buttonPresses = (uint8_t)constrain(vv.toInt(), 0, 255);
@@ -2302,13 +2363,15 @@ static bool parseMacToBytes(const String& mac, uint8_t out[6]) {
 static void buildTag2AdvRaw(uint8_t out[31], uint8_t& outLen) {
   memset(out, 0, 31);
   uint8_t p[10];
+  // Final format:
+  // [0]BTN [1]BAT [2]ADV_MODE [3..4]FAST_H_LE [5..6]SLOW_H_LE [7]CONN_CNT [8..9]APP_FLAGS_BE
   p[0] = buttonPresses;
   p[1] = batteryLevel;
   p[2] = advFastMode ? 1 : 0;
-  p[3] = fastHours;
-  p[4] = (uint8_t)(slowHours >> 8);
+  p[3] = (uint8_t)(fastHours & 0xFF);
+  p[4] = (uint8_t)((fastHours >> 8) & 0xFF);
   p[5] = (uint8_t)(slowHours & 0xFF);
-  p[6] = connectionStateCode;
+  p[6] = (uint8_t)((slowHours >> 8) & 0xFF);
   p[7] = connAttempts;
   p[8] = (uint8_t)(statusFlags >> 8);
   p[9] = (uint8_t)(statusFlags & 0xFF);
@@ -2372,7 +2435,7 @@ static void applySendToAdvertiser() {
                 (unsigned)rawLen,
                 customRndOk ? "RANDOM(custom)" : "RANDOM(failed)");
 
-  if (advEnabled) {
+  if (advEnabled && !resetCooldownActive) {
     bool ok = tag2Adv->start();
     Serial.printf("[TAG2] ADV start returned=%d\n", ok ? 1 : 0);
   }
@@ -2407,11 +2470,14 @@ static void drawSendView() {
     if (i == 4) drawButton(204, y - 2, 18, 14, "M", false, false);
   }
 
-  // Last row: BACK + MODE on left, PW ON/OFF on right.
+  // Last row: BACK + MODE + Rst + PW ON/OFF.
   tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
   drawButton(0, 304, 57, 16, "Back", false, false);
   drawButton(60, 304, 57, 16, "Mode", false, false);
+  drawButton(120, 304, 57, 16, "Rst", false, false);
   drawButton(177, 304, 57, 16, advEnabled ? "On" : "Off", false, false);
+
+  drawResetCountdownOverlay();
 }
 
 static void ensureBleInit() {
@@ -2433,9 +2499,9 @@ static void cacheProfilesFromCurrentResults() {
     tp.manualSave = false;
     tp.mac = String(d.getAddress().toString().c_str());
     tp.mode = p[2] ? true : false;
-    tp.fast_h = p[3];
-    tp.slow_h = ((uint16_t)p[4] << 8) | p[5];
-    tp.state = p[6];
+    tp.fast_h = ((uint16_t)p[4] << 8) | p[3];
+    tp.slow_h = ((uint16_t)p[6] << 8) | p[5];
+    tp.state = connectionStateCode;
     tp.conn = p[7];
     tp.flags = ((uint16_t)p[8] << 8) | p[9];
     tp.btn = p[0];
@@ -2498,15 +2564,23 @@ void displayScanning() {
 static void bgBleScanTask(void* ) {
   ensureBleInit();
   for (;;) {
+    if (bgPauseReq) {
+      if (bleScan) bleScan->stop();
+      bgScanActive = false;
+      vTaskDelay(120 / portTICK_PERIOD_MS);
+      continue;
+    }
     const uint32_t now = millis();
     if (bgBootMs == 0) bgBootMs = now;
 
     const bool idleOk = (now - bgBootMs) > BG_BOOT_GRACE_MS;
     if (settings().autoBleScan && idleOk && !feature_active && !in_sub_menu) {
       isScanning = true;
-
+      bgScanActive = true;
+      bleScan->clearResults();
       bleResults = bleScan->start(2, false);
       rebuildTag2Index();
+      bgScanActive = false;
       isScanning = false;
       if (bleResults.getCount() >= 0) {
         bgHasResults = (filteredCount() > 0);
@@ -2536,6 +2610,7 @@ void startBLEScan() {
   headerIconsDirty = true;
   ensureBleInit();
   isScanning = true;
+  bleScan->clearResults();
   bleResults = bleScan->start(5, false);
   rebuildTag2Index();
   cacheProfilesFromCurrentResults();
@@ -2804,9 +2879,8 @@ void displayBLEDetails() {
       selectedMac = address;
       buttonPresses = p[0];
       batteryLevel = (uint8_t)constrain((int)p[1], 0, 100);
-      fastHours = p[3];
-      slowHours = ((uint16_t)p[4] << 8) | p[5];
-      connectionStateCode = p[6];
+      fastHours = ((uint16_t)p[4] << 8) | p[3];
+      slowHours = ((uint16_t)p[6] << 8) | p[5];
       connAttempts = p[7];
       statusFlags = ((uint16_t)p[8] << 8) | p[9];
       advFastMode = p[2] ? true : false;
@@ -2986,7 +3060,7 @@ void runUI() {
         }
       } else if (!isScanning) {
         if (isSendView) {
-          // Last row controls in SEND: BACK, MODE, PW ON/OFF.
+          // Last row controls in SEND: BACK, MODE, Rst, PW ON/OFF.
           if (y >= 304 && y <= 320) {
             if (x >= 0 && x <= 57) {
               isSendView = false;
@@ -2998,6 +3072,22 @@ void runUI() {
               advFastMode = !advFastMode;
               applySendToAdvertiser();
               screenNeedsUpdate = true;
+              lastTouchActionMs = nowMs;
+            } else if (x >= 120 && x <= 177) {
+              resetSendPayloadParamsKeepBattery();
+              if (advEnabled) {
+                if (tag2Adv) tag2Adv->stop();
+                resetCooldownActive = true;
+                resetCooldownResumeMs = millis() + 10000;
+                resetCooldownLastUiMs = 0;
+                lastResetCountdownShown = -1;
+                showNotification("TAG2", "Beacon OFF 10s");
+              } else {
+                applySendToAdvertiser();
+                showNotification("TAG2", "Params reset");
+              }
+              screenNeedsUpdate = true;
+              fullScreenUpdate = true;
               lastTouchActionMs = nowMs;
             } else if (x >= 177 && x <= 234) {
               advEnabled = !advEnabled;
@@ -3023,10 +3113,10 @@ void runUI() {
                     batteryLevel = (uint8_t)constrain(b, 0, 100);
                   }
                 } else if (x >= 164 && x <= 180) { // plus
-                  if (row == 0 && fastHours < 255) fastHours++;
+                  if (row == 0 && fastHours < 65535) fastHours++;
                   else if (row == 1 && slowHours < 65535) slowHours++;
                   else if (row == 2 && connAttempts < 255) connAttempts++;
-                  else if (row == 3 && buttonPresses < 255) buttonPresses++;
+                  else if (row == 3 && buttonPresses < 255) { buttonPresses++; markGuiIncrementEventFlag(); }
                   else if (row == 4) {
                     int b = (int)batteryLevel + batteryStepWithJitter();
                     batteryLevel = (uint8_t)constrain(b, 0, 100);
@@ -3035,7 +3125,11 @@ void runUI() {
                   if (row == 0) fastHours = 0;
                   else if (row == 1) slowHours = 0;
                   else if (row == 2) connAttempts = 0;
-                  else if (row == 3) buttonPresses = 0;
+                  else if (row == 3) {
+                    buttonPresses = 0;
+                    // Requested behavior: resetting button counter clears payload offset 9 bit0.
+                    statusFlags &= (uint16_t)~TAG2_APP_FLAG_GUI_INCREMENT;
+                  }
                 } else if (row == 4 && x >= 204 && x <= 222) { // MAX
                   batteryLevel = 100;
                 }
@@ -3164,22 +3258,36 @@ void bleScanSetup() {
   pcf.pinMode(BTN_LEFT, INPUT_PULLUP);
 
   ensureBleInit();
-  rebuildTag2Index();
-
-  if (bgHasResults && filteredCount() > 0) {
-    current_page = 0;
-    currentIndex = 0;
-    listStartIndex = 0;
-    isDetailView = false;
-    screenNeedsUpdate = true;
-    fullScreenUpdate = true;
-    updateBLEList();
-  } else {
-    startBLEScan();
-  }
+  // Cross-tool transition hardening:
+  // ensure no residual scanner session is still active before Tag2 starts.
+  quiesceBleScan();
+  // Do not reuse cached BLE results across tool transitions:
+  // force a fresh scan to avoid stale/fragmented result copies.
+  bgHasResults = false;
+  startBLEScan();
 }
 
 void bleScanLoop() {
+  if (resetCooldownActive && (millis() - resetCooldownLastUiMs) >= 200) {
+    resetCooldownLastUiMs = millis();
+    const int32_t leftMs = (int32_t)(resetCooldownResumeMs - millis());
+    const int leftSec = max(0, (int)((leftMs + 999) / 1000));
+    if (leftSec != lastResetCountdownShown && isSendView) {
+      lastResetCountdownShown = leftSec;
+      drawResetCountdownOverlay();
+    }
+  }
+  if (resetCooldownActive && (int32_t)(millis() - resetCooldownResumeMs) >= 0) {
+    resetCooldownActive = false;
+    resetCooldownLastUiMs = 0;
+    lastResetCountdownShown = -1;
+    if (advEnabled) {
+      applySendToAdvertiser();
+      showNotification("TAG2", "Beacon resumed");
+    }
+    if (isSendView) drawResetCountdownOverlay();
+    screenNeedsUpdate = true;
+  }
 
   if (feature_active && isButtonPressed(BTN_SELECT)) {
     stopLiveScan();
@@ -3209,16 +3317,9 @@ void bleScanLoop() {
 }
 
 void startBackgroundScanner() {
-  if (bgBleScanTaskHandle != nullptr) return;
-  xTaskCreatePinnedToCore(
-    bgBleScanTask,
-    "bgBleScan",
-    4096,
-    nullptr,
-    1,
-    &bgBleScanTaskHandle,
-    0
-  );
+  // Disabled for stability on ESP32-DIV V2:
+  // concurrent background scans caused cross-tool BLE reboots.
+  bgBleScanTaskHandle = nullptr;
 }
 
 int getLastCount() {
@@ -3232,10 +3333,9 @@ void exit() {
   stopLiveScan();
   if (tag2Adv) tag2Adv->stop();
   advEnabled = false;
-  if (isScanning && bleScan) {
-    bleScan->stop();
-    isScanning = false;
-  }
+  if (isScanning) isScanning = false;
+  quiesceBleScan();
+  bgHasResults = false;
 }
 }
 

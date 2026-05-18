@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <PCF8574.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
@@ -20,7 +22,12 @@ PCF8574 pcf(pcf_ADDR);
 static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 static bool g_pixels_init = false;
 extern unsigned long last_interaction_time;
-static constexpr uint32_t kPixelIdleTimeoutMs = 30000;
+
+static uint32_t sleepTimeoutMsFromSettings() {
+  uint8_t s = settings().sleepSeconds;
+  if (s == 15 || s == 30 || s == 60) return (uint32_t)s * 1000UL;
+  return 0;
+}
 
 static void pixelsEnsureInit() {
   if (g_pixels_init) return;
@@ -68,9 +75,11 @@ static void pixelsUpdateState() {
     return;
   }
 
-  // Tie pixels to UI inactivity timeout: off when idle for too long.
+  // Tie pixels to configurable sleep timeout: off when idle for too long.
+  const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
   const uint32_t nowIdle = millis();
-  if (last_interaction_time > 0 && (nowIdle - last_interaction_time) > kPixelIdleTimeoutMs) {
+  if (idleTimeoutMs > 0 && last_interaction_time > 0 &&
+      (nowIdle - last_interaction_time) > idleTimeoutMs) {
     if (pixelsLit) {
       pixelsFill(0, 0, 0);
       pr = pg = pb = 0;
@@ -121,6 +130,93 @@ static void pixelsUpdateState() {
 
 void setBrightness(uint8_t value) {
   ledcWrite(PWM_CHANNEL, value);
+}
+
+static void forceBacklightOff() {
+  ledcDetachPin(BACKLIGHT_PIN);
+  pinMode(BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(BACKLIGHT_PIN, BACKLIGHT_OFF_LEVEL);
+  gpio_sleep_set_direction((gpio_num_t)BACKLIGHT_PIN, GPIO_MODE_OUTPUT);
+  gpio_sleep_set_pull_mode((gpio_num_t)BACKLIGHT_PIN, GPIO_FLOATING);
+  gpio_sleep_sel_en((gpio_num_t)BACKLIGHT_PIN);
+  gpio_hold_en((gpio_num_t)BACKLIGHT_PIN);
+}
+
+static void restoreBacklightPwm(uint8_t value) {
+  gpio_hold_dis((gpio_num_t)BACKLIGHT_PIN);
+  gpio_sleep_sel_dis((gpio_num_t)BACKLIGHT_PIN);
+  ledcAttachPin(BACKLIGHT_PIN, PWM_CHANNEL);
+  ledcWrite(PWM_CHANNEL, value);
+}
+
+static void serviceDisplaySleep() {
+  static bool sleeping = false;
+  static bool blForcedOff = false;
+  static uint32_t lastSeenInteraction = 0;
+  const uint32_t now = millis();
+  const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
+  const uint32_t lastInt = last_interaction_time;
+  const bool toolActive = feature_active;
+
+  if (lastInt != lastSeenInteraction) {
+    lastSeenInteraction = lastInt;
+    if (sleeping) {
+      if (blForcedOff) {
+        restoreBacklightPwm(settings().brightness);
+        blForcedOff = false;
+      } else {
+        setBrightness(settings().brightness);
+      }
+      sleeping = false;
+      displayMenu();
+    }
+  }
+
+  if (idleTimeoutMs == 0) {
+    if (sleeping) {
+      if (blForcedOff) {
+        restoreBacklightPwm(settings().brightness);
+        blForcedOff = false;
+      } else {
+        setBrightness(settings().brightness);
+      }
+      sleeping = false;
+      displayMenu();
+    }
+    return;
+  }
+
+  // Never enter light sleep while a tool is active; avoids radio/UI instability.
+  if (toolActive) {
+    if (sleeping) {
+      if (blForcedOff) {
+        restoreBacklightPwm(settings().brightness);
+        blForcedOff = false;
+      } else {
+        setBrightness(settings().brightness);
+      }
+      sleeping = false;
+      displayMenu();
+    }
+    return;
+  }
+
+  if (!sleeping && lastInt > 0 && (now - lastInt) > idleTimeoutMs) {
+    // Keep panel black on this hardware; DISPOFF/SLPIN produced white screen.
+    tft.fillScreen(TFT_BLACK);
+    drawStatusBar(currentBatteryVoltage, false);
+    forceBacklightOff();
+    blForcedOff = true;
+    sleeping = true;
+  }
+
+  if (sleeping) {
+    // Re-assert BL off each sleep cycle in case pad state is touched by peripherals.
+    forceBacklightOff();
+    // Keep MCU in light sleep while inactive, waking periodically to poll inputs.
+    esp_sleep_enable_timer_wakeup(200000); // 200 ms
+    esp_light_sleep_start();
+  }
 }
 
 bool feature_exit_requested = false;
@@ -1197,6 +1293,21 @@ void handleWiFiSubmenuButtons() {
 }
 
 void handleBluetoothSubmenuButtons() {
+    auto stabilizeBleTransition = []() {
+        BLEAdvertising* adv = BLEDevice::getAdvertising();
+        if (adv) {
+            adv->stop();
+            delay(60);
+        }
+        ::BLEScan* scan = BLEDevice::getScan();
+        if (scan) {
+            scan->stop();
+            delay(60);
+            scan->clearResults();
+        }
+        delay(320);
+        yield();
+    };
     if (isButtonPressed(BTN_UP)) {
         current_submenu_index = (current_submenu_index - 1 + active_submenu_size) % active_submenu_size;
         if (current_submenu_index < 0) {
@@ -1377,6 +1488,7 @@ void handleBluetoothSubmenuButtons() {
             in_sub_menu = true;
             feature_active = true;
             feature_exit_requested = false;
+            stabilizeBleTransition();
             BleScan::bleScanSetup();
             while (current_submenu_index == 4 && !feature_exit_requested) {
                 current_submenu_index = 4;
@@ -1413,6 +1525,7 @@ void handleBluetoothSubmenuButtons() {
             in_sub_menu = true;
             feature_active = true;
             feature_exit_requested = false;
+            stabilizeBleTransition();
             BleTag2::bleScanSetup();
             while (current_submenu_index == 5 && !feature_exit_requested) {
                 current_submenu_index = 5;
@@ -1644,6 +1757,7 @@ void handleBluetoothSubmenuButtons() {
                     in_sub_menu = true;
                     feature_active = true;
                     feature_exit_requested = false;
+                    stabilizeBleTransition();
                     BleScan::bleScanSetup();
                     while (current_submenu_index == 4 && !feature_exit_requested) {
                         current_submenu_index = 4;
@@ -1677,6 +1791,7 @@ void handleBluetoothSubmenuButtons() {
                     in_sub_menu = true;
                     feature_active = true;
                     feature_exit_requested = false;
+                    stabilizeBleTransition();
                     BleTag2::bleScanSetup();
                     while (current_submenu_index == 5 && !feature_exit_requested) {
                         current_submenu_index = 5;
@@ -3618,7 +3733,8 @@ void setup() {
 
 void loop() {
   applyThemeToPalette(settings().theme);
-  pixelsUpdateState();
   handleButtons();
+  serviceDisplaySleep();
+  pixelsUpdateState();
   updateStatusBar();
 }

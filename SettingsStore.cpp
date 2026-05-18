@@ -7,6 +7,10 @@
 static AppSettings g_settings;
 AppSettings& settings() { return g_settings; }
 static Preferences g_prefs;
+static uint8_t normalizeSleepSeconds(uint8_t v) {
+  if (v == 15 || v == 30 || v == 60) return v;
+  return 0;
+}
 static bool touchCalibLooksValid(uint16_t xMin, uint16_t xMax, uint16_t yMin, uint16_t yMax) {
   return (abs((int)xMax - (int)xMin) >= 100) &&
          (abs((int)yMax - (int)yMin) >= 100);
@@ -108,6 +112,12 @@ bool settingsLoad() {
   s.brightness      = doc["brightness"]      | s.brightness;
   s.theme           = (Theme)(uint8_t)(doc["theme"] | (uint8_t)s.theme);
   s.neopixelEnabled = doc["neopixelEnabled"] | s.neopixelEnabled;
+  uint8_t sleepVal = (uint8_t)(doc["sleepSeconds"] | s.sleepSeconds);
+  if (!doc.containsKey("sleepSeconds")) {
+    // Backward compatibility with previous key name.
+    sleepVal = (uint8_t)(doc["sleepMinutes"] | sleepVal);
+  }
+  s.sleepSeconds    = normalizeSleepSeconds(sleepVal);
 
   s.autoWifiScan    = doc["autoWifiScan"]    | s.autoWifiScan;
   s.autoBleScan     = doc["autoBleScan"]     | s.autoBleScan;
@@ -149,6 +159,7 @@ bool settingsSave() {
   doc["brightness"]      = s.brightness;
   doc["theme"]           = (uint8_t)s.theme;
   doc["neopixelEnabled"] = s.neopixelEnabled;
+  doc["sleepSeconds"]    = normalizeSleepSeconds(s.sleepSeconds);
 
   doc["autoWifiScan"]    = s.autoWifiScan;
   doc["autoBleScan"]     = s.autoBleScan;
