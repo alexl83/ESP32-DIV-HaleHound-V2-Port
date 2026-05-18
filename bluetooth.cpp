@@ -1512,6 +1512,7 @@ static TaskHandle_t bgBleScanTaskHandle = nullptr;
 static volatile bool bgHasResults = false;
 static volatile bool bgPauseReq = false;
 static volatile bool bgScanActive = false;
+static volatile bool bleScanToolActive = false;
 static volatile uint32_t bgLastScanMs = 0;
 static volatile bool bgBleScanRunning = false;
 static volatile bool fgBleScanInProgress = false;
@@ -1990,6 +1991,7 @@ void bleScanSetup() {
 
   ensureBleInit();
   quiesceBleScan();
+  bleScanToolActive = true;
 
   // Do not reuse cached BLE results across tool transitions:
   // stale result objects can trigger heap-heavy copies in getDevice().
@@ -2032,13 +2034,16 @@ void startBackgroundScanner() {
 int getLastCount() {
 
   if (!settings().autoBleScan) return 0;
+  if (!bleScanToolActive) return 0;
   return bleResults.getCount();
 }
 
 void exit() {
 
+  bleScanToolActive = false;
   if (isScanning) isScanning = false;
   quiesceBleScan();
+  bleResults = BLEScanResults();
   bgHasResults = false;
 }
 }
@@ -5018,13 +5023,14 @@ private:
   int newDevicesThisScan = 0;
   int lastDeviceCount = -1;
   int lastSuspiciousCount = -1;
+  unsigned long lastMaxDevicesWarningTime = 0;
   bool scanning = true;
   bool isBLEScanActive = true;
   unsigned long lastScanTime = 0;
   unsigned long lastFlashToggle = 0;
   bool flashState = false;
   BLEScan* pBLEScan = nullptr;
-  BLEAdvertisedDeviceCallbacks* bleDeviceCallbacks = nullptr;
+  bool isRunning = false;
   static BluetoothSniffer* snifferInstance;
 
   void releaseBleCallbacks() {
@@ -5127,7 +5133,7 @@ private:
   }
 
   void addLine(String text, uint16_t color, bool isAlert = false, MessageType type = MessageType::DEVICE) {
-    if (!scanning) return;
+    if (!isRunning) return;
     if (text.length() > MAX_LINE_LENGTH) {
       text = text.substring(0, MAX_LINE_LENGTH - 3) + "...";
     }
@@ -5178,13 +5184,43 @@ private:
     return (value & 0xC0) == 0xC0;
   }
 
+  int findReplacementSlot(unsigned long timestamp) {
+    if (deviceCount <= 0) return 0;
+
+    for (int i = 0; i < deviceCount; i++) {
+      if (timestamp - devices[i].lastSeen > Config::deviceTimeout) {
+        return i;
+      }
+    }
+
+    int oldestIdx = 0;
+    unsigned long oldestSeen = devices[0].lastSeen;
+    for (int i = 1; i < deviceCount; i++) {
+      if (devices[i].lastSeen < oldestSeen) {
+        oldestSeen = devices[i].lastSeen;
+        oldestIdx = i;
+      }
+    }
+    return oldestIdx;
+  }
+
   void processNewDevice(BLEAdvertisedDevice* bleDevice, esp_bt_gap_cb_param_t* btDevice, unsigned long timestamp, bool isBLE) {
-    if (deviceCount >= MAX_DEVICES) {
-      addLine("Max devices reached!", RED, true, MessageType::ALERT);
-      return;
+    int targetIdx = deviceCount;
+    bool tableFull = (deviceCount >= MAX_DEVICES);
+    if (tableFull) {
+      targetIdx = findReplacementSlot(timestamp);
+      if (targetIdx < 0 || targetIdx >= MAX_DEVICES) return;
+      if (devices[targetIdx].isSuspicious && suspiciousCount > 0) {
+        suspiciousCount--;
+      }
+      if (timestamp - lastMaxDevicesWarningTime > 5000) {
+        addLine("Max devices reached: rotating cache", UI_DIM_TEXT, false, MessageType::STATUS);
+        lastMaxDevicesWarningTime = timestamp;
+      }
     }
     newDevicesThisScan++;
-    auto& device = devices[deviceCount];
+    auto& device = devices[targetIdx];
+    device = DeviceInfo();
     device.isBLE = isBLE;
     if (isBLE) {
       device.mac = bleDevice->getAddress().toString().c_str();
@@ -5206,7 +5242,7 @@ private:
     device.lastSeen = timestamp;
     device.display = true;
     checkMacSpoofing(device, timestamp);
-    checkSuspiciousActivity(deviceCount, timestamp);
+    checkSuspiciousActivity(targetIdx, timestamp);
     if (device.display) {
       String protocol = isBLE ? "BLE" : "BT";
       String line = String(lineNumber++) + " -> " + device.mac + " (" + String(device.rssi) + " dBm, " + protocol + ")";
@@ -5215,7 +5251,9 @@ private:
       line += " T:" + String(timestamp).substring(0, 6);
       addLine(line, device.isSuspicious ? ORANGE : GREEN, false, MessageType::DEVICE);
     }
-    deviceCount++;
+    if (!tableFull) {
+      deviceCount++;
+    }
     if (newDevicesThisScan > Config::maxNewDevices && device.display) {
       String protocol = isBLE ? "BLE" : "BT";
       addLine(String(lineNumber++) + " -> Flooding Detected (" + protocol + ") T:" + String(timestamp),
@@ -5421,6 +5459,7 @@ void runUI() {
 
 public:
   void setup() {
+    isRunning = true;
     uiDrawn = false;
 
     float currentBatteryVoltage = readBatteryVoltage();
@@ -5443,11 +5482,7 @@ public:
   }
 
   void loop() {
-    if (feature_exit_requested || featureExitButtonPressed()) {
-      feature_exit_requested = true;
-      return;
-    }
-
+    if (!isRunning) return;
     unsigned long now = millis();
     tft.drawFastHLine(0, 19, 240, UI_LINE);
 
@@ -5528,7 +5563,7 @@ public:
   };
 
   static void btCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
-    if (!snifferInstance) return;
+    if (!snifferInstance || !snifferInstance->isRunning) return;
     if (event == ESP_BT_GAP_DISC_RES_EVT) {
       unsigned long timestamp = millis();
       int idx = -1;
@@ -5582,9 +5617,14 @@ public:
   }
 
   void stop() {
+    isRunning = false;
     scanning = false;
+    if (pBLEScan) {
+      pBLEScan->stop();
+      pBLEScan->setAdvertisedDeviceCallbacks(nullptr);
+      pBLEScan->clearResults();
+    }
     snifferInstance = nullptr;
-    releaseBleCallbacks();
   }
 };
 
