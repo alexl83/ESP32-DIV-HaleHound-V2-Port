@@ -21,7 +21,18 @@ PCF8574 pcf(pcf_ADDR);
 static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 static bool g_pixels_init = false;
 extern unsigned long last_interaction_time;
+extern int current_submenu_index;
+extern int current_menu_index;
+extern bool menu_initialized;
+extern int last_menu_index;
+extern int last_submenu_index;
+extern uint8_t other_layer;
+extern int active_submenu_size;
+extern bool other_menu_grid_initialized;
+extern int last_other_menu_index;
 static bool g_blockUiUntilAllReleased = false;
+static uint32_t g_blockUiUntilMs = 0;
+static bool g_displaySleeping = false;
 
 static uint32_t sleepTimeoutMsFromSettings() {
   uint8_t s = settings().sleepSeconds;
@@ -154,10 +165,20 @@ static void serviceDisplaySleep() {
   static bool blForcedOff = false;
   static uint32_t lastSeenInteraction = 0;
   static bool prevToolActive = false;
+  static bool sleepSnapInSubMenu = false;
+  static int sleepSnapMenuIndex = 0;
+  static int sleepSnapSubmenuIndex = 0;
+  static uint8_t sleepSnapOtherLayer = 0; // OTHER_LAYER_HOME
   const uint32_t now = millis();
   const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
   uint32_t lastInt = last_interaction_time;
   const bool toolActive = feature_active;
+  const bool anyBtnRaw =
+      !pcf.digitalRead(BTN_UP) || !pcf.digitalRead(BTN_DOWN) ||
+      !pcf.digitalRead(BTN_LEFT) || !pcf.digitalRead(BTN_RIGHT) ||
+      !pcf.digitalRead(BTN_SELECT);
+  const bool anyTouchRaw = ts.touched();
+  const bool anyInputRaw = anyBtnRaw || anyTouchRaw;
 
   // Reset idle timer when leaving any tool to avoid immediate sleep on return.
   if (prevToolActive && !toolActive) {
@@ -166,6 +187,54 @@ static void serviceDisplaySleep() {
     lastInt = now;
   }
   prevToolActive = toolActive;
+
+  auto redrawCurrentUiContext = [&]() {
+    in_sub_menu = sleepSnapInSubMenu;
+    current_menu_index = sleepSnapMenuIndex;
+    current_submenu_index = sleepSnapSubmenuIndex;
+    other_layer = sleepSnapOtherLayer;
+
+    menu_initialized = false;
+    submenu_initialized = false;
+    last_menu_index = -1;
+    last_submenu_index = -1;
+    tft.fillScreen(TFT_BLACK);
+    if (in_sub_menu) {
+      updateActiveSubmenu();
+      if (active_submenu_size > 0) {
+        if (current_submenu_index < 0) current_submenu_index = 0;
+        if (current_submenu_index >= active_submenu_size) {
+          current_submenu_index = active_submenu_size - 1;
+        }
+      } else {
+        current_submenu_index = 0;
+      }
+      if (current_menu_index == 2 && other_layer == 0) {
+        other_menu_grid_initialized = false;
+        last_other_menu_index = -1;
+      }
+      displaySubmenu();
+    } else {
+      displayMenu();
+    }
+  };
+
+  if (sleeping && anyInputRaw) {
+    if (blForcedOff) {
+      restoreBacklightPwm(settings().brightness);
+      blForcedOff = false;
+    } else {
+      setBrightness(settings().brightness);
+    }
+    sleeping = false;
+    g_displaySleeping = false;
+    last_interaction_time = now;
+    lastSeenInteraction = now;
+    redrawCurrentUiContext();
+    g_blockUiUntilAllReleased = true;
+    g_blockUiUntilMs = now + 260;
+    return;
+  }
 
   if (lastInt != lastSeenInteraction) {
     lastSeenInteraction = lastInt;
@@ -177,7 +246,10 @@ static void serviceDisplaySleep() {
         setBrightness(settings().brightness);
       }
       sleeping = false;
-      displayMenu();
+      g_displaySleeping = false;
+      redrawCurrentUiContext();
+      g_blockUiUntilAllReleased = true;
+      g_blockUiUntilMs = millis() + 260;
     }
   }
 
@@ -190,7 +262,8 @@ static void serviceDisplaySleep() {
         setBrightness(settings().brightness);
       }
       sleeping = false;
-      displayMenu();
+      g_displaySleeping = false;
+      redrawCurrentUiContext();
     }
     return;
   }
@@ -205,25 +278,32 @@ static void serviceDisplaySleep() {
         setBrightness(settings().brightness);
       }
       sleeping = false;
-      displayMenu();
+      g_displaySleeping = false;
+      redrawCurrentUiContext();
     }
     return;
   }
 
   if (!sleeping && lastInt > 0 && (now - lastInt) > idleTimeoutMs) {
+    sleepSnapInSubMenu = in_sub_menu;
+    sleepSnapMenuIndex = current_menu_index;
+    sleepSnapSubmenuIndex = current_submenu_index;
+    sleepSnapOtherLayer = other_layer;
     // Keep panel black on this hardware; DISPOFF/SLPIN produced white screen.
     tft.fillScreen(TFT_BLACK);
     drawStatusBar(currentBatteryVoltage, false);
     forceBacklightOff();
     blForcedOff = true;
     sleeping = true;
+    g_displaySleeping = true;
   }
 
   if (sleeping) {
+    g_displaySleeping = true;
     // Re-assert BL off each sleep cycle in case pad state is touched by peripherals.
     forceBacklightOff();
     // Keep MCU in light sleep while inactive, waking periodically to poll inputs.
-    esp_sleep_enable_timer_wakeup(200000); // 200 ms
+    esp_sleep_enable_timer_wakeup(20000); // 20 ms
     esp_light_sleep_start();
   }
 }
@@ -3720,11 +3800,26 @@ void setup() {
 
 void loop() {
   applyThemeToPalette(settings().theme);
+  serviceDisplaySleep();
+  if (g_displaySleeping) {
+    pixelsUpdateState();
+    return;
+  }
+  const bool anyBtnRaw =
+      !pcf.digitalRead(BTN_UP) || !pcf.digitalRead(BTN_DOWN) ||
+      !pcf.digitalRead(BTN_LEFT) || !pcf.digitalRead(BTN_RIGHT) ||
+      !pcf.digitalRead(BTN_SELECT);
+  const bool anyTouchRaw = ts.touched();
+  if (millis() < g_blockUiUntilMs) {
+    pixelsUpdateState();
+    updateStatusBar();
+    return;
+  }
   if (g_blockUiUntilAllReleased) {
     const bool anyBtn =
-        isButtonPressed(BTN_UP) || isButtonPressed(BTN_DOWN) ||
-        isButtonPressed(BTN_LEFT) || isButtonPressed(BTN_RIGHT) ||
-        isButtonPressed(BTN_SELECT);
+        !pcf.digitalRead(BTN_UP) || !pcf.digitalRead(BTN_DOWN) ||
+        !pcf.digitalRead(BTN_LEFT) || !pcf.digitalRead(BTN_RIGHT) ||
+        !pcf.digitalRead(BTN_SELECT);
     const bool anyTouch = ts.touched();
     if (anyBtn || anyTouch) {
       pixelsUpdateState();
@@ -3732,9 +3827,14 @@ void loop() {
       return;
     }
     g_blockUiUntilAllReleased = false;
+    last_interaction_time = millis();
+    // Extra debounce after wake-release to prevent carry-over action.
+    g_blockUiUntilMs = millis() + 450;
+    pixelsUpdateState();
+    updateStatusBar();
+    return;
   }
   handleButtons();
-  serviceDisplaySleep();
   pixelsUpdateState();
   updateStatusBar();
 }
