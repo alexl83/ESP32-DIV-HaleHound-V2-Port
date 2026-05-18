@@ -153,10 +153,19 @@ static void serviceDisplaySleep() {
   static bool sleeping = false;
   static bool blForcedOff = false;
   static uint32_t lastSeenInteraction = 0;
+  static bool prevToolActive = false;
   const uint32_t now = millis();
   const uint32_t idleTimeoutMs = sleepTimeoutMsFromSettings();
-  const uint32_t lastInt = last_interaction_time;
+  uint32_t lastInt = last_interaction_time;
   const bool toolActive = feature_active;
+
+  // Reset idle timer when leaving any tool to avoid immediate sleep on return.
+  if (prevToolActive && !toolActive) {
+    last_interaction_time = now;
+    lastSeenInteraction = now;
+    lastInt = now;
+  }
+  prevToolActive = toolActive;
 
   if (lastInt != lastSeenInteraction) {
     lastSeenInteraction = lastInt;
@@ -835,8 +844,7 @@ const int Y_SPACING = 75;
 void displayOtherMenuGrid();
 
 void displaySubmenu() {
-    setTouchButtonInputEnabled(false);
-
+    last_interaction_time = millis();
     if (current_menu_index == 2 && other_layer == OTHER_LAYER_HOME) {
         displayOtherMenuGrid();
         return;
@@ -900,6 +908,7 @@ void displaySubmenu() {
 }
 
 void displayOtherMenuGrid() {
+    last_interaction_time = millis();
     applyThemeToPalette(settings().theme);
 
     submenu_initialized = false;
@@ -992,6 +1001,7 @@ static void drawMainMenuOtherTripleIcons(int x_position, int y_position, uint16_
 }
 
 void displayMenu() {
+  last_interaction_time = millis();
 
   setTouchButtonInputEnabled(false);
   applyThemeToPalette(settings().theme);
