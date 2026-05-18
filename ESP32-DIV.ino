@@ -21,6 +21,7 @@ PCF8574 pcf(pcf_ADDR);
 static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 static bool g_pixels_init = false;
 extern unsigned long last_interaction_time;
+static bool g_blockUiUntilAllReleased = false;
 
 static uint32_t sleepTimeoutMsFromSettings() {
   uint8_t s = settings().sleepSeconds;
@@ -1119,8 +1120,9 @@ void handleWiFiSubmenuButtons() {
             feature_active = false;
             feature_exit_requested = false;
             displayMenu();
-            handleButtons();
             is_main_menu = false;
+            g_blockUiUntilAllReleased = true;
+            return;
         }
 
         if (current_submenu_index == 0) {
@@ -1326,7 +1328,7 @@ void handleWiFiSubmenuButtons() {
                 delay(200);
             }
         }
-        if (current_submenu_index == 7) {
+        else if (current_submenu_index == 6) {
             current_submenu_index = 6;
             in_sub_menu = true;
             feature_active = true;
@@ -1385,8 +1387,9 @@ void handleWiFiSubmenuButtons() {
                     feature_active = false;
                     feature_exit_requested = false;
                     displayMenu();
-                    handleButtons();
                     is_main_menu = false;
+                    g_blockUiUntilAllReleased = true;
+                    return;
                 } else if (current_submenu_index == 0) {
                     current_submenu_index = 0;
                     in_sub_menu = true;
@@ -3567,6 +3570,8 @@ void handleButtons() {
                     in_sub_menu = true;
                     submenu_initialized = false;
                     displaySubmenu();
+                    g_blockUiUntilAllReleased = true;
+                    return;
                 }
 
                 if (is_main_menu) {
@@ -3705,6 +3710,19 @@ void setup() {
 
 void loop() {
   applyThemeToPalette(settings().theme);
+  if (g_blockUiUntilAllReleased) {
+    const bool anyBtn =
+        isButtonPressed(BTN_UP) || isButtonPressed(BTN_DOWN) ||
+        isButtonPressed(BTN_LEFT) || isButtonPressed(BTN_RIGHT) ||
+        isButtonPressed(BTN_SELECT);
+    const bool anyTouch = ts.touched();
+    if (anyBtn || anyTouch) {
+      pixelsUpdateState();
+      updateStatusBar();
+      return;
+    }
+    g_blockUiUntilAllReleased = false;
+  }
   handleButtons();
   serviceDisplaySleep();
   pixelsUpdateState();
