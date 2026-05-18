@@ -4963,6 +4963,7 @@ static const unsigned char* icons[ICON_NUM] = {
 #define MAX_LINES 16
 #define MAX_DEVICES 32
 #define SCAN_INTERVAL 5000
+#define PHASE_WATCHDOG_MS 20000
 #define MAX_LINE_LENGTH 38
 #define BEACON_PREFIX "4c000215"
 #define ALERT_FLASH_DURATION 1000
@@ -5027,33 +5028,43 @@ private:
   bool scanning = true;
   bool isBLEScanActive = true;
   bool pendingBleRestart = false;
+  bool pendingToggleSuspiciousFilter = false;
+  bool showSuspiciousOnly = false;
+  uint32_t uiActionCooldownUntil = 0;
   unsigned long lastScanTime = 0;
+  unsigned long lastPhaseToggleTime = 0;
   unsigned long lastFlashToggle = 0;
   bool flashState = false;
   BLEScan* pBLEScan = nullptr;
   bool isRunning = false;
   static BluetoothSniffer* snifferInstance;
 
-  void releaseBleCallbacks() {
-    if (pBLEScan) {
-      pBLEScan->stop();
-      pBLEScan->setAdvertisedDeviceCallbacks(nullptr);
+  void resetState() {
+    deviceCount = 0;
+    lineNumber = 1;
+    suspiciousCount = 0;
+    newDevicesThisScan = 0;
+    lastDeviceCount = -1;
+    lastSuspiciousCount = -1;
+    lastMaxDevicesWarningTime = 0;
+    isBLEScanActive = true;
+    pendingBleRestart = false;
+    pendingToggleSuspiciousFilter = false;
+    showSuspiciousOnly = false;
+    uiActionCooldownUntil = 0;
+    lastScanTime = 0;
+    lastPhaseToggleTime = 0;
+    for (int i = 0; i < MAX_LINES; i++) {
+      displayLines[i].text = "";
+      displayLines[i].color = GREEN;
+      displayLines[i].originalColor = GREEN;
+      displayLines[i].isAlert = false;
+      displayLines[i].flashUntil = 0;
+      displayLines[i].type = MessageType::DEVICE;
     }
-    delete bleDeviceCallbacks;
-    bleDeviceCallbacks = nullptr;
-  }
-
-  static int snifferContentTop() {
-    return Y_OFFSET + HEADER_HEIGHT;
-  }
-
-  static int snifferVisibleLines() {
-    return bleMaxLinesInZone(snifferContentTop(), LINE_HEIGHT);
-  }
-
-  static bool snifferLineFits(int lineIndex) {
-    const int y = snifferContentTop() + (lineIndex * LINE_HEIGHT);
-    return y + LINE_HEIGHT <= bleContentBottom();
+    for (int i = 0; i < MAX_DEVICES; i++) {
+      devices[i] = DeviceInfo();
+    }
   }
 
   void initDisplay() {
@@ -5241,7 +5252,7 @@ private:
     }
     device.packetCount = 1;
     device.lastSeen = timestamp;
-    device.display = true;
+    device.display = showSuspiciousOnly ? device.isSuspicious : true;
     checkMacSpoofing(device, timestamp);
     checkSuspiciousActivity(targetIdx, timestamp);
     if (device.display) {
@@ -5408,10 +5419,12 @@ void runUI() {
             pendingBleRestart = true;
           break;
         case 1:
-           filterSuspicious();
+           pendingToggleSuspiciousFilter = true;
+           uiActionCooldownUntil = millis() + 450;
           break;
         case 2:
            feature_exit_requested = true;
+           uiActionCooldownUntil = millis() + 450;
           break;
       }
     } else if (animationState == 2) {
@@ -5422,40 +5435,47 @@ void runUI() {
   }
 
   static unsigned long lastTouchCheck = 0;
-  static bool s_headerTouchHeld = false;
-  const unsigned long touchCheckInterval = 25;
+  const unsigned long touchCheckInterval = 50;
+  static bool touchWasDown = false;
+  static uint32_t lastBackTapMs = 0;
 
   if (millis() - lastTouchCheck >= touchCheckInterval) {
-    int x = 0;
-    int y = 0;
-    int hitIcon = -1;
-    if (feature_active && readTouchXY(x, y)) {
+    int x, y;
+    const bool touched = feature_active && readTouchXY(x, y);
+    if (touched && millis() >= uiActionCooldownUntil) {
+      // Dedicated back handler with larger hitbox and its own debounce.
+      const bool inBackHitbox = (x >= 0 && x <= 40 &&
+                                 y >= (STATUS_BAR_Y_OFFSET - 2) &&
+                                 y <= (STATUS_BAR_Y_OFFSET + STATUS_BAR_HEIGHT + 2));
+      if (inBackHitbox && (millis() - lastBackTapMs > 250) &&
+          !pendingBleRestart && !pendingToggleSuspiciousFilter) {
+        feature_exit_requested = true;
+        uiActionCooldownUntil = millis() + 350;
+        lastBackTapMs = millis();
+        touchWasDown = touched;
+        lastTouchCheck = millis();
+        return;
+      }
+    }
+
+    if (touched && !touchWasDown && millis() >= uiActionCooldownUntil &&
+        !pendingBleRestart && !pendingToggleSuspiciousFilter) {
       if (y > STATUS_BAR_Y_OFFSET && y < STATUS_BAR_Y_OFFSET + STATUS_BAR_HEIGHT) {
         for (int i = 0; i < ICON_NUM; i++) {
           if (x > iconX[i] && x < iconX[i] + ICON_SIZE) {
             if (icons[i] != NULL && animationState == 0) {
-              hitIcon = i;
+              tft.drawBitmap(iconX[i], iconY, icons[i], ICON_SIZE, ICON_SIZE, TFT_BLACK);
+              animationState = 1;
+              activeIcon = i;
+              lastAnimationTime = millis();
+              uiActionCooldownUntil = millis() + 350;
             }
             break;
           }
         }
       }
     }
-    if (hitIcon >= 0) {
-      if (!s_headerTouchHeld) {
-        if (hitIcon == 2) {
-          feature_exit_requested = true;
-        } else {
-          tft.drawBitmap(iconX[hitIcon], iconY, icons[hitIcon], ICON_SIZE, ICON_SIZE, TFT_BLACK);
-          animationState = 1;
-          activeIcon = hitIcon;
-          lastAnimationTime = millis();
-        }
-      }
-      s_headerTouchHeld = true;
-    } else {
-      s_headerTouchHeld = false;
-    }
+    touchWasDown = touched;
     lastTouchCheck = millis();
   }
 }
@@ -5463,6 +5483,7 @@ void runUI() {
 public:
   void setup() {
     isRunning = true;
+    resetState();
     uiDrawn = false;
 
     float currentBatteryVoltage = readBatteryVoltage();
@@ -5482,6 +5503,7 @@ public:
 
     addLine("Bluetooth Sniffer Ready", DARK_GRAY, true, MessageType::STATUS);
     startBLEScan();
+    lastPhaseToggleTime = millis();
   }
 
   void loop() {
@@ -5497,12 +5519,26 @@ public:
     updateStatusBar();
     cleanupDevices(now);
 
+    if (pendingToggleSuspiciousFilter) {
+      pendingToggleSuspiciousFilter = false;
+      showSuspiciousOnly = !showSuspiciousOnly;
+      for (int i = 0; i < deviceCount; i++) {
+        devices[i].display = showSuspiciousOnly ? devices[i].isSuspicious : true;
+      }
+      refreshDisplay();
+      addLine(showSuspiciousOnly ? "Filter: suspicious only" : "Filter: all devices",
+              DARK_GRAY, true, MessageType::STATUS);
+      lastScanTime = now;
+      return;
+    }
+
     if (pendingBleRestart) {
       pendingBleRestart = false;
       if (pBLEScan) pBLEScan->stop();
       isBLEScanActive = true;
       startBLEScan();
       lastScanTime = millis();
+      lastPhaseToggleTime = millis();
       return;
     }
 
@@ -5517,6 +5553,20 @@ public:
         isBLEScanActive = true;
       }
       lastScanTime = now;
+      lastPhaseToggleTime = now;
+    }
+
+    // Phase watchdog: if BLE/BT phase does not flip for too long, reinit BLE scan.
+    if (scanning && (now - lastPhaseToggleTime > PHASE_WATCHDOG_MS)) {
+      addLine("Phase watchdog: reinit scan", DARK_GRAY, true, MessageType::STATUS);
+      if (pBLEScan) {
+        pBLEScan->stop();
+        pBLEScan->clearResults();
+      }
+      isBLEScanActive = true;
+      startBLEScan();
+      lastScanTime = now;
+      lastPhaseToggleTime = now;
     }
     if (Serial.available()) {
       String input = Serial.readStringUntil('\n');
@@ -5631,6 +5681,7 @@ public:
 
   void stop() {
     isRunning = false;
+    resetState();
     scanning = false;
     if (pBLEScan) {
       pBLEScan->stop();
