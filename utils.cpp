@@ -1409,6 +1409,7 @@ static bool     last_neopixel;
 static bool     last_autoScan;
 static uint8_t  last_sleepSeconds;
 static int      last_sel;
+static bool     pending_neopixel;
 
 static bool dragging = false;
 
@@ -1733,8 +1734,7 @@ static void drawAll() {
   auto& s = settings();
   drawBrightness(s.brightness, sel==0);
   drawTheme(s.theme, sel==1);
-  drawAccent(s.accentColor, sel==2);
-  drawNeoPixel(s.neopixelEnabled, sel==3);
+  drawNeoPixel(pending_neopixel, sel==2);
   bool autoScan = (s.autoWifiScan || s.autoBleScan);
   drawAutoScan(autoScan, sel==3);
   drawSleep(s.sleepSeconds, sel==4);
@@ -1744,8 +1744,7 @@ static void drawAll() {
   last_sel        = sel;
   last_brightness = s.brightness;
   last_theme      = s.theme;
-  last_accent     = s.accentColor;
-  last_neopixel   = s.neopixelEnabled;
+  last_neopixel   = pending_neopixel;
   last_autoScan     = autoScan;
   last_sleepSeconds = s.sleepSeconds;
   uiDirty = false;
@@ -1764,8 +1763,7 @@ static void redrawIfChanged() {
   if (sel != last_sel) {
     drawCardStatic(0, sel==0);  drawBrightnessWidget(s.brightness, sel==0);
     drawCardStatic(1, sel==1);  drawThemeWidget(s.theme, sel==1);
-    drawCardStatic(2, sel==2);  drawAccentWidget(s.accentColor, sel==2);
-    drawCardStatic(3, sel==3);  drawSwitchWidgetRow(s.neopixelEnabled, sel==3, 3);
+    drawCardStatic(2, sel==2);  drawSwitchWidgetRow(pending_neopixel, sel==2, 2);
     bool autoScan = (s.autoWifiScan || s.autoBleScan);
     drawCardStatic(3, sel==3);  drawSwitchWidgetRow(autoScan, sel==3, 3);
     drawCardStatic(4, sel==4);  drawSleepWidget(s.sleepSeconds, sel==4);
@@ -1775,9 +1773,9 @@ static void redrawIfChanged() {
       drawBrightnessWidget(s.brightness, sel==0);
       last_brightness = s.brightness;
     }
-    if (s.neopixelEnabled != last_neopixel) {
-      drawSwitchWidgetRow(s.neopixelEnabled, sel==3, 3);
-      last_neopixel = s.neopixelEnabled;
+    if (pending_neopixel != last_neopixel) {
+      drawSwitchWidgetRow(pending_neopixel, sel==2, 2);
+      last_neopixel = pending_neopixel;
     }
     bool autoScan = (s.autoWifiScan || s.autoBleScan);
     if (autoScan != last_autoScan) {
@@ -1832,9 +1830,8 @@ static bool applyAccent(uint8_t preset){
   return true;
 }
 static bool applyNeoPixel(bool en){
-  auto& s = settings();
-  if (s.neopixelEnabled == en) return false;
-  s.neopixelEnabled = en;
+  if (pending_neopixel == en) return false;
+  pending_neopixel = en;
   dirtySettings = true;
   uiDirty = true;
   lastChangeMs = millis();
@@ -1900,8 +1897,10 @@ static void handleTouch() {
     delay(25);
     drawFooter(false, false);
     if (dirtySettings) {
+      settings().neopixelEnabled = pending_neopixel;
       bool ok = settingsSave();
       if (ok) {
+        refreshNeoPixelNow();
         dirtySettings = false;
         footerToast("Saved", UI.ok);
         delay(250);
@@ -1958,7 +1957,7 @@ static void handleTouch() {
     if (tx >= tr.x && tx <= tr.x+tr.w && ty >= tr.y-10 && ty <= tr.y+tr.h+10) {
       uint32_t now = millis();
       if (now - lastToggleMs > 120) {
-        applyNeoPixel(!s.neopixelEnabled);
+        applyNeoPixel(!pending_neopixel);
         lastToggleMs = now;
       }
     }
@@ -1990,6 +1989,7 @@ void setup(){
   applyThemeToPalette(settings().theme);
   buildPalette();
   ::setBrightness(settings().brightness);
+  pending_neopixel = settings().neopixelEnabled;
   sel = 0; dirtySettings = false; uiDirty = false; dragging = false;
   drawAll();
 }
@@ -2060,6 +2060,8 @@ void loop(){
   handleTouch();
 
   if (changedByButtons || uiDirty) redrawIfChanged();
+  // Keep NeoPixel animation running while Settings is open.
+  refreshNeoPixelNow();
 
   delay(2);
 }

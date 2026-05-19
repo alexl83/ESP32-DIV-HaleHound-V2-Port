@@ -33,6 +33,7 @@ void requestStatusBarRedraw();
 extern bool feature_exit_requested;
 
 extern void setBrightness(uint8_t value);
+extern void refreshNeoPixelNow();
 bool isButtonPressed(int buttonPin);
 /** True while the PCF8574 button for this pin is held (no touch nav). */
 bool isPhysicalButtonPressed(int buttonPin);
