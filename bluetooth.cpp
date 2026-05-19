@@ -2026,15 +2026,22 @@ void bleScanLoop() {
 }
 
 void startBackgroundScanner() {
-  // Disabled for stability on ESP32-DIV V2:
-  // concurrent background scans caused cross-tool BLE reboots.
-  bgBleScanTaskHandle = nullptr;
+  if (bgBleScanTaskHandle != nullptr) return;
+  bgPauseReq = false;
+  bgBootMs = 0;
+  xTaskCreatePinnedToCore(
+      bgBleScanTask,
+      "bgBleScan",
+      4096,
+      nullptr,
+      1,
+      &bgBleScanTaskHandle,
+      0);
 }
 
 int getLastCount() {
 
   if (!settings().autoBleScan) return 0;
-  if (!bleScanToolActive) return 0;
   return bleResults.getCount();
 }
 
