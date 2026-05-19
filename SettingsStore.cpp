@@ -7,8 +7,8 @@
 static AppSettings g_settings;
 AppSettings& settings() { return g_settings; }
 static Preferences g_prefs;
-static uint8_t normalizeSleepSeconds(uint8_t v) {
-  if (v == 15 || v == 30 || v == 60) return v;
+static uint16_t normalizeSleepSeconds(uint16_t v) {
+  if (v == 15 || v == 30 || v == 60 || v == 120 || v == 300 || v == 600) return v;
   return 0;
 }
 static bool touchCalibLooksValid(uint16_t xMin, uint16_t xMax, uint16_t yMin, uint16_t yMax) {
@@ -109,7 +109,7 @@ bool settingsLoad() {
   s.theme           = (Theme)(uint8_t)(doc["theme"] | (uint8_t)s.theme);
   s.accentColor     = accentPresetClamp(doc["accentColor"] | s.accentColor);
   s.neopixelEnabled = doc["neopixelEnabled"] | s.neopixelEnabled;
-  uint8_t sleepVal = (uint8_t)(doc["sleepSeconds"] | s.sleepSeconds);
+  uint16_t sleepVal = (uint16_t)(doc["sleepSeconds"] | s.sleepSeconds);
   if (!doc.containsKey("sleepSeconds")) {
     // Backward compatibility with previous key name.
     sleepVal = (uint8_t)(doc["sleepMinutes"] | sleepVal);

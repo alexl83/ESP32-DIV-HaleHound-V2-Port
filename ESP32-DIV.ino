@@ -36,8 +36,8 @@ static uint32_t g_blockUiUntilMs = 0;
 static bool g_displaySleeping = false;
 
 static uint32_t sleepTimeoutMsFromSettings() {
-  uint8_t s = settings().sleepSeconds;
-  if (s == 15 || s == 30 || s == 60) return (uint32_t)s * 1000UL;
+  uint16_t s = settings().sleepSeconds;
+  if (s == 15 || s == 30 || s == 60 || s == 120 || s == 300 || s == 600) return (uint32_t)s * 1000UL;
   return 0;
 }
 

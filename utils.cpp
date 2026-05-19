@@ -1407,7 +1407,7 @@ static Theme    last_theme;
 static uint8_t  last_accent;
 static bool     last_neopixel;
 static bool     last_autoScan;
-static uint8_t  last_sleepSeconds;
+static uint16_t last_sleepSeconds;
 static int      last_sel;
 static bool     pending_neopixel;
 
@@ -1646,15 +1646,18 @@ static void drawSwitchRow(bool on, bool selected, int row) {
 
 static void drawNeoPixel(bool on, bool selected) { drawSwitchRow(on, selected, 2); }
 static void drawAutoScan(bool on, bool selected) { drawSwitchRow(on, selected, 3); }
-static const char* sleepLabel(uint8_t m) {
+static const char* sleepLabel(uint16_t m) {
   switch (m) {
     case 15: return "15s";
     case 30: return "30s";
     case 60: return "60s";
+    case 120: return "2m";
+    case 300: return "5m";
+    case 600: return "10m";
     default: return "Off";
   }
 }
-static void drawSleepWidget(uint8_t minutes, bool ) {
+static void drawSleepWidget(uint16_t minutes, bool ) {
   tft.startWrite();
   wipeSwitchWidgetArea(4);
   Rect r = rowRect(4);
@@ -1668,7 +1671,7 @@ static void drawSleepWidget(uint8_t minutes, bool ) {
   tft.print(v);
   tft.endWrite();
 }
-static void drawSleep(uint8_t minutes, bool selected) {
+static void drawSleep(uint16_t minutes, bool selected) {
   drawCardStatic(4, selected);
   drawSleepWidget(minutes, selected);
 }
@@ -1848,11 +1851,11 @@ static bool applyAutoScan(bool en){
   lastChangeMs = millis();
   return true;
 }
-static uint8_t normalizeSleep(uint8_t v) {
-  if (v == 15 || v == 30 || v == 60) return v;
+static uint16_t normalizeSleep(uint16_t v) {
+  if (v == 15 || v == 30 || v == 60 || v == 120 || v == 300 || v == 600) return v;
   return 0;
 }
-static bool applySleepMinutes(uint8_t v){
+static bool applySleepMinutes(uint16_t v){
   auto& s = settings();
   v = normalizeSleep(v);
   if (s.sleepSeconds == v) return false;
@@ -1862,16 +1865,22 @@ static bool applySleepMinutes(uint8_t v){
   lastChangeMs = millis();
   return true;
 }
-static uint8_t nextSleepValue(uint8_t cur) {
+static uint16_t nextSleepValue(uint16_t cur) {
   cur = normalizeSleep(cur);
   if (cur == 0) return 15;
   if (cur == 15) return 30;
   if (cur == 30) return 60;
+  if (cur == 60) return 120;
+  if (cur == 120) return 300;
+  if (cur == 300) return 600;
   return 0;
 }
-static uint8_t prevSleepValue(uint8_t cur) {
+static uint16_t prevSleepValue(uint16_t cur) {
   cur = normalizeSleep(cur);
-  if (cur == 0) return 60;
+  if (cur == 0) return 600;
+  if (cur == 600) return 300;
+  if (cur == 300) return 120;
+  if (cur == 120) return 60;
   if (cur == 60) return 30;
   if (cur == 30) return 15;
   return 0;
