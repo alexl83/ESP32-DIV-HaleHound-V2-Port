@@ -4,6 +4,7 @@
 #include <PCF8574.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
+#include <Adafruit_NeoPixel.h>
 #include "SettingsStore.h"
 #include "Touchscreen.h"
 #include "config.h"

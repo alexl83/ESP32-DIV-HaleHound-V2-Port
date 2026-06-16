@@ -709,6 +709,12 @@ enum class Theme : uint8_t { Dark = 0, Light = 1 };
 #ifndef NEOPIXEL_BRIGHT_MAX
 #define NEOPIXEL_BRIGHT_MAX 64
 #endif
+#ifndef NEOPIXEL_PIN
+#define NEOPIXEL_PIN 1
+#endif
+#ifndef NEOPIXEL_COUNT
+#define NEOPIXEL_COUNT 4
+#endif
 #ifndef SETTINGS_PATH
 #define SETTINGS_PATH "/config/settings.json"
 #endif
