@@ -74,14 +74,6 @@ namespace Scanner {
   void scannerSetup();
   void scannerLoop();
 }
-namespace Analyzer {
-  void analyzerSetup();
-  void analyzerLoop();
-}
-namespace WLANJammer {
-  void wlanjammerSetup();
-  void wlanjammerLoop();
-}
 namespace ProtoKill {
   void prokillSetup();
   void prokillLoop();
@@ -126,6 +118,10 @@ namespace WifiScan {
   void startBackgroundScanner();
   // Last known WiFi network count from background/foreground scans.
   int  getLastCount();
+  bool wifiCacheValidForReuse();
+  int  staWifiScanSync();
+  bool loadApListFromWifiCache(wifi_ap_record_t** ap_list, int* network_count,
+                               int (*compare_ap)(const void*, const void*));
 }
 namespace CaptivePortal {
   void cportalSetup();

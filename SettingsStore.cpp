@@ -1,53 +1,61 @@
 #include <ArduinoJson.h>
 #include <SD.h>
-#include <Preferences.h>
 #include "SettingsStore.h"
+#include "utils.h"
 
 
 static AppSettings g_settings;
 AppSettings& settings() { return g_settings; }
-static Preferences g_prefs;
-static bool touchCalibLooksValid(uint16_t xMin, uint16_t xMax, uint16_t yMin, uint16_t yMax) {
-  return (abs((int)xMax - (int)xMin) >= 100) &&
-         (abs((int)yMax - (int)yMin) >= 100);
+
+static const AccentOption kAccentPresets[] = {
+  {"Orange", 0xFBE4},
+  {"Green",  0x07E0},
+  {"Red",    0xF800},
+  {"Cyan",   0x07FF},
+  {"Purple", 0xF81F},
+  {"Yellow", 0xFFE0},
+  {"White",  0xFFFF},
+};
+
+uint8_t accentPresetClamp(uint8_t preset) {
+  if (preset >= ACCENT_PRESET_COUNT) return 0;
+  return preset;
 }
 
-static bool loadTouchFromNVS() {
-  if (!g_prefs.begin("touchcal", true)) return false;
+uint16_t accentColor565(uint8_t preset) {
+  return kAccentPresets[accentPresetClamp(preset)].color565;
+}
+
+const char* accentPresetName(uint8_t preset) {
+  return kAccentPresets[accentPresetClamp(preset)].name;
+}
+
+const char* settingsBoardProfileId() {
+  return TOUCH_PROFILE_ID;
+}
+
+void settingsApplyBoardTouchDefaults() {
   auto& s = g_settings;
-  bool has = g_prefs.getBool("has", false);
-  if (has) {
-    uint16_t xMin = g_prefs.getUShort("xMin", s.touchXMin);
-    uint16_t xMax = g_prefs.getUShort("xMax", s.touchXMax);
-    uint16_t yMin = g_prefs.getUShort("yMin", s.touchYMin);
-    uint16_t yMax = g_prefs.getUShort("yMax", s.touchYMax);
-    bool swapXY   = g_prefs.getBool("swap", s.touchSwapXY);
-    if (touchCalibLooksValid(xMin, xMax, yMin, yMax)) {
-      s.touchXMin = xMin;
-      s.touchXMax = xMax;
-      s.touchYMin = yMin;
-      s.touchYMax = yMax;
-      s.touchSwapXY = swapXY;
-    } else {
-      has = false;
-    }
-  }
-  g_prefs.end();
-  return has;
+  s.touchXMin = TOUCH_X_MIN;
+  s.touchXMax = TOUCH_X_MAX;
+  s.touchYMin = TOUCH_Y_MIN;
+  s.touchYMax = TOUCH_Y_MAX;
 }
 
-static bool saveTouchToNVS() {
-  if (!g_prefs.begin("touchcal", false)) return false;
-  const auto& s = g_settings;
-  bool ok = true;
-  ok &= g_prefs.putBool("has", true) > 0;
-  ok &= g_prefs.putUShort("xMin", s.touchXMin) > 0;
-  ok &= g_prefs.putUShort("xMax", s.touchXMax) > 0;
-  ok &= g_prefs.putUShort("yMin", s.touchYMin) > 0;
-  ok &= g_prefs.putUShort("yMax", s.touchYMax) > 0;
-  ok &= g_prefs.putBool("swap", s.touchSwapXY) > 0;
-  g_prefs.end();
-  return ok;
+static bool settingsTouchSavedForBoard(const StaticJsonDocument<512>& doc) {
+  JsonObjectConst touch = doc["touch"];
+  if (touch.isNull()) {
+    return false;
+  }
+  if (!touch["xMin"].is<uint16_t>() || !touch["xMax"].is<uint16_t>() ||
+      !touch["yMin"].is<uint16_t>() || !touch["yMax"].is<uint16_t>()) {
+    return false;
+  }
+  const char* savedBoard = doc["board"] | "";
+  if (savedBoard[0] == '\0') {
+    return true;
+  }
+  return strcmp(savedBoard, TOUCH_PROFILE_ID) == 0;
 }
 
 static bool sd_mounted = false;
@@ -57,17 +65,20 @@ static bool mountSD() {
     if (SD.exists("/")) return true;
     sd_mounted = false;
   }
+
+  sdSpiInit();
+
   #ifdef SD_CS
-  if (SD.begin(SD_CS)) { sd_mounted = true; return true; }
+  if (sdMountChipSelect(SD_CS)) { sd_mounted = true; return true; }
   #endif
   #ifdef SD_CS_PIN
 
   #ifdef CC1101_CS
   if (SD_CS_PIN != CC1101_CS) {
-    if (SD.begin(SD_CS_PIN)) { sd_mounted = true; return true; }
+    if (sdMountChipSelect(SD_CS_PIN)) { sd_mounted = true; return true; }
   }
   #else
-  if (SD.begin(SD_CS_PIN)) { sd_mounted = true; return true; }
+  if (sdMountChipSelect(SD_CS_PIN)) { sd_mounted = true; return true; }
   #endif
   #endif
   return false;
@@ -87,14 +98,9 @@ static bool ensureDir(const char* dirPath) {
 }
 
 bool settingsLoad() {
-  if (!mountSD()) {
-    loadTouchFromNVS();
-    return false;
-  }
-  if (!SD.exists(SETTINGS_PATH)) {
-    loadTouchFromNVS();
-    return true;
-  }
+  settingsApplyBoardTouchDefaults();
+  if (!mountSD()) return false;
+  if (!SD.exists(SETTINGS_PATH)) return true;
 
   File f = SD.open(SETTINGS_PATH, FILE_READ);
   if (!f) return false;
@@ -107,6 +113,7 @@ bool settingsLoad() {
   auto& s = g_settings;
   s.brightness      = doc["brightness"]      | s.brightness;
   s.theme           = (Theme)(uint8_t)(doc["theme"] | (uint8_t)s.theme);
+  s.accentColor     = accentPresetClamp(doc["accentColor"] | s.accentColor);
   s.neopixelEnabled = doc["neopixelEnabled"] | s.neopixelEnabled;
 
   s.autoWifiScan    = doc["autoWifiScan"]    | s.autoWifiScan;
@@ -118,11 +125,15 @@ bool settingsLoad() {
     s.autoBleScan  = en;
   }
 
-  s.touchXMin       = doc["touch"]["xMin"]   | s.touchXMin;
-  s.touchXMax       = doc["touch"]["xMax"]   | s.touchXMax;
-  s.touchYMin       = doc["touch"]["yMin"]   | s.touchYMin;
-  s.touchYMax       = doc["touch"]["yMax"]   | s.touchYMax;
-  s.touchSwapXY     = doc["touch"]["swapXY"] | s.touchSwapXY;
+  if (settingsTouchSavedForBoard(doc)) {
+    JsonObjectConst touch = doc["touch"];
+    s.touchXMin = touch["xMin"] | s.touchXMin;
+    s.touchXMax = touch["xMax"] | s.touchXMax;
+    s.touchYMin = touch["yMin"] | s.touchYMin;
+    s.touchYMax = touch["yMax"] | s.touchYMax;
+  } else {
+    settingsApplyBoardTouchDefaults();
+  }
 
   return true;
 }
@@ -131,23 +142,23 @@ bool settingsSave() {
 
   if (!ensureDir("/config")) {
     sd_mounted = false;
-    if (!ensureDir("/config")) {
-      return saveTouchToNVS();
-    }
+    if (!ensureDir("/config")) return false;
   }
 
   File f = SD.open(SETTINGS_PATH, FILE_WRITE);
   if (!f) {
     sd_mounted = false;
-    if (!mountSD()) return saveTouchToNVS();
+    if (!mountSD()) return false;
     f = SD.open(SETTINGS_PATH, FILE_WRITE);
-    if (!f) return saveTouchToNVS();
+    if (!f) return false;
   }
 
   auto& s = g_settings;
   StaticJsonDocument<512> doc;
+  doc["board"]           = TOUCH_PROFILE_ID;
   doc["brightness"]      = s.brightness;
   doc["theme"]           = (uint8_t)s.theme;
+  doc["accentColor"]     = s.accentColor;
   doc["neopixelEnabled"] = s.neopixelEnabled;
 
   doc["autoWifiScan"]    = s.autoWifiScan;
@@ -158,14 +169,8 @@ bool settingsSave() {
   t["xMax"] = s.touchXMax;
   t["yMin"] = s.touchYMin;
   t["yMax"] = s.touchYMax;
-  t["swapXY"] = s.touchSwapXY;
 
   bool ok = serializeJson(doc, f) > 0;
   f.close();
-  bool nvsOk = saveTouchToNVS();
-  return ok || nvsOk;
-}
-
-bool settingsSaveTouchOnly() {
-  return saveTouchToNVS();
+  return ok;
 }
