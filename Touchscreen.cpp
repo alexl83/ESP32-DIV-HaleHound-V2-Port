@@ -123,14 +123,16 @@ bool readTouchRawXY(int16_t& x, int16_t& y, uint16_t zThresh) {
 
 static void mapTouchToScreen(int16_t rawX, int16_t rawY, int& x, int& y) {
   auto& s = settings();
-#if defined(BOARD_CYD)
-  // Same axis order as the RNT CYD touch test (no inverted Y).
+#if defined(BOARD_CYD) || defined(BOARD_ESP32_DIV_V2)
+  // V2 shares the same axis order as the display, so keep Y non-inverted.
   x = ::map(rawX, s.touchXMin, s.touchXMax, 0, TFT_WIDTH - 1);
   y = ::map(rawY, s.touchYMin, s.touchYMax, 0, TFT_HEIGHT - 1);
 #else
   x = ::map(rawX, s.touchXMin, s.touchXMax, 0, TFT_WIDTH - 1);
   y = ::map(rawY, s.touchYMax, s.touchYMin, 0, TFT_HEIGHT - 1);
 #endif
+  x = constrain(x, 0, TFT_WIDTH - 1);
+  y = constrain(y, 0, TFT_HEIGHT - 1);
 }
 
 bool readTouchXY(int& x, int& y) {

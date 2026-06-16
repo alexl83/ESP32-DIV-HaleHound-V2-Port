@@ -31,6 +31,7 @@ void startStatusBarTask();
 void requestStatusBarRedraw();
 
 extern bool feature_exit_requested;
+extern bool settings_ui_active;
 
 extern void setBrightness(uint8_t value);
 extern void refreshNeoPixelNow();

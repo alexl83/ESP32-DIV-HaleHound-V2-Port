@@ -147,6 +147,14 @@ bool settingsLoad() {
     s.touchXMax = touch["xMax"] | s.touchXMax;
     s.touchYMin = touch["yMin"] | s.touchYMin;
     s.touchYMax = touch["yMax"] | s.touchYMax;
+#if defined(BOARD_ESP32_DIV_V2)
+    // Older V2 builds stored Y inverted; normalize that historical layout on load.
+    if (s.touchYMin > s.touchYMax) {
+      uint16_t yMin = s.touchYMin;
+      s.touchYMin = s.touchYMax;
+      s.touchYMax = yMin;
+    }
+#endif
   } else {
     settingsApplyBoardTouchDefaults();
   }

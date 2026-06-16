@@ -2954,7 +2954,14 @@ void loop() {
 namespace TouchCalib {
 static int stepIdx = 0;
 static uint16_t xs[4], ys[4];
-static const int pts[4][2] = { {20,20}, {TFT_WIDTH-20,20}, {TFT_WIDTH-20,TFT_HEIGHT-20}, {20,TFT_HEIGHT-20} };
+// Calibrate almost to the physical edges so the mapped area uses the full screen.
+static const int kCalibInset = 8;
+static const int pts[4][2] = {
+  {kCalibInset, kCalibInset},
+  {TFT_WIDTH - 1 - kCalibInset, kCalibInset},
+  {TFT_WIDTH - 1 - kCalibInset, TFT_HEIGHT - 1 - kCalibInset},
+  {kCalibInset, TFT_HEIGHT - 1 - kCalibInset}
+};
 
 static void drawTarget(int x,int y){
   tft.fillScreen(UI_BG);
@@ -2979,7 +2986,7 @@ void loop(){
     uint16_t yMax = max(ys[2], ys[3]);
     auto& s = settings();
     s.touchXMin = xMin; s.touchXMax = xMax;
-#if defined(BOARD_CYD)
+#if defined(BOARD_CYD) || defined(BOARD_ESP32_DIV_V2)
     s.touchYMin = yMin; s.touchYMax = yMax;
 #else
     s.touchYMin = yMax; s.touchYMax = yMin;

@@ -72,7 +72,7 @@ static void pixelsBootAnim() {
   delay(80);
 }
 
-static void pixelsUpdateState() {
+void pixelsUpdateState() {
   static uint32_t lastMs = 0;
   static int8_t kittDir = 1;
   static int8_t kittPos = 0;
@@ -327,6 +327,7 @@ static void serviceDisplaySleep() {
 }
 
 bool feature_exit_requested = false;
+bool settings_ui_active = false;
 
 const int NUM_MENU_ITEMS = 8;
 const char *menu_items[NUM_MENU_ITEMS] = {
@@ -4002,6 +4003,7 @@ void handleAboutPage() {
 void handleSettingsSubmenuButtons() {
 
   feature_active = true;
+  settings_ui_active = true;
   feature_exit_requested = false;
 
   AppSettingsUI::setup();
@@ -4010,6 +4012,7 @@ void handleSettingsSubmenuButtons() {
   }
 
   feature_active = false;
+  settings_ui_active = false;
   feature_exit_requested = false;
 
   in_sub_menu = false;

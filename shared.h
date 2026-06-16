@@ -741,6 +741,7 @@ static inline uint16_t uiDimTextColor() {
 /*──────────────────── Global State Flags ────────────────────*/
 extern bool in_sub_menu;
 extern bool feature_active;
+extern bool settings_ui_active;
 extern bool submenu_initialized;
 extern bool is_main_menu;
 extern bool feature_exit_requested;
