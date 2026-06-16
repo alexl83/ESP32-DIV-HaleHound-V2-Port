@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <esp_sleep.h>
 #include <driver/gpio.h>
+#include <Adafruit_NeoPixel.h>
 #include <PCF8574.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
@@ -17,7 +18,7 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-PCF8574 pcf(pcf_ADDR);
+PCF8574 pcf(PCF8574_I2C_ADDR);
 static Adafruit_NeoPixel g_pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 static bool g_pixels_init = false;
 static bool g_inAboutPage = false;

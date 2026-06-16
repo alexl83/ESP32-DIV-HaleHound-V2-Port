@@ -83,6 +83,13 @@ namespace ProtoKill {
   void prokillSetup();
   void prokillLoop();
 }
+namespace WLANJammer {
+  inline void wlanjammerSetup() { ProtoKill::prokillSetup(); }
+  inline void wlanjammerLoop()   { ProtoKill::prokillLoop(); }
+}
+namespace Analyzer {
+  inline void analyzerLoop() { Scanner::scannerLoop(); }
+}
 namespace BleSniffer {
   void blesnifferSetup();
   void blesnifferLoop();

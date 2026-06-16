@@ -17,6 +17,8 @@
 #include <vector>
 #include <map>
 
+static void stopBgBleScanIfRunning();
+
 #ifdef TFT_BLACK
 #undef TFT_BLACK
 #endif
@@ -4590,6 +4592,10 @@ void scannerLoop() {
 
 }  // namespace Scanner
 
+static void stopBgBleScanIfRunning() {
+  BleScan::exit();
+}
+
 namespace ProtoKill {
 
 RF24 radio1(CE_PIN_1, CSN_PIN_1, 16000000);
@@ -4978,6 +4984,15 @@ static const unsigned char* icons[ICON_NUM] = {
 #define SEPARATOR_MARGIN 5
 #define Y_OFFSET 37
 
+static constexpr int kSnifferContentTop = Y_OFFSET + HEADER_HEIGHT;
+static int snifferContentTop() { return kSnifferContentTop; }
+static int snifferVisibleLines() {
+  return max(1, (bleContentBottom() - snifferContentTop()) / LINE_HEIGHT);
+}
+static bool snifferLineFits(int lineIndex) {
+  return snifferContentTop() + (lineIndex * LINE_HEIGHT) + LINE_HEIGHT <= bleContentBottom();
+}
+
 struct Config {
   static constexpr int tftRotation = 0;
   static constexpr int serialBaud = 115200;
@@ -5043,6 +5058,7 @@ private:
   unsigned long lastFlashToggle = 0;
   bool flashState = false;
   BLEScan* pBLEScan = nullptr;
+  BLEAdvertisedDeviceCallbacks* bleDeviceCallbacks = nullptr;
   bool isRunning = false;
   static BluetoothSniffer* snifferInstance;
 
@@ -5072,6 +5088,13 @@ private:
     for (int i = 0; i < MAX_DEVICES; i++) {
       devices[i] = DeviceInfo();
     }
+  }
+
+  void releaseBleCallbacks() {
+    if (!pBLEScan) return;
+    pBLEScan->setAdvertisedDeviceCallbacks(nullptr);
+    delete bleDeviceCallbacks;
+    bleDeviceCallbacks = nullptr;
   }
 
   void initDisplay() {
@@ -5692,7 +5715,7 @@ public:
     scanning = false;
     if (pBLEScan) {
       pBLEScan->stop();
-      pBLEScan->setAdvertisedDeviceCallbacks(nullptr);
+      releaseBleCallbacks();
       pBLEScan->clearResults();
     }
     snifferInstance = nullptr;

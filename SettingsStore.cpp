@@ -1,11 +1,27 @@
 #include <ArduinoJson.h>
 #include <SD.h>
+#include <Preferences.h>
 #include "SettingsStore.h"
 #include "utils.h"
 
 
 static AppSettings g_settings;
 AppSettings& settings() { return g_settings; }
+static const AccentOption kAccentPresets[] = {
+  {"Orange", 0xFBE4},
+  {"Green",  0x07E0},
+  {"Red",    0xF800},
+  {"Cyan",   0x07FF},
+  {"Purple", 0xF81F},
+  {"Yellow", 0xFFE0},
+  {"White",  0xFFFF},
+};
+
+uint8_t accentPresetClamp(uint8_t preset) {
+  if (preset >= ACCENT_PRESET_COUNT) return 0;
+  return preset;
+}
+
 static Preferences g_prefs;
 static uint16_t normalizeSleepSeconds(uint16_t v) {
   if (v == 15 || v == 30 || v == 60 || v == 120 || v == 300 || v == 600) return v;
