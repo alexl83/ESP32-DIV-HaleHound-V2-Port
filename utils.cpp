@@ -1980,8 +1980,8 @@ static void handleTouch() {
         lastToggleMs = now;
       }
     }
-  } else if (sel == 4) {
-    Rect rr = rowRect(4);
+  } else if (sel == 5) {
+    Rect rr = rowRect(5);
     int triggerX = rr.x + LABEL_W;
     if (tx >= triggerX && tx <= rr.x + rr.w && ty >= rr.y && ty <= rr.y + rr.h) {
       uint32_t now = millis();
