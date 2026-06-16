@@ -40,6 +40,53 @@ const char* accentPresetName(uint8_t preset) {
   return kAccentPresets[accentPresetClamp(preset)].name;
 }
 
+static constexpr const char* kTouchPrefsNs = "touchcal";
+static constexpr const char* kTouchPrefsBoardKey = "board";
+static constexpr const char* kTouchPrefsXMinKey = "xMin";
+static constexpr const char* kTouchPrefsXMaxKey = "xMax";
+static constexpr const char* kTouchPrefsYMinKey = "yMin";
+static constexpr const char* kTouchPrefsYMaxKey = "yMax";
+
+static void loadTouchFromPrefs() {
+  Preferences prefs;
+  if (!prefs.begin(kTouchPrefsNs, true)) {
+    return;
+  }
+
+  const String savedBoard = prefs.getString(kTouchPrefsBoardKey, "");
+  if (savedBoard != TOUCH_PROFILE_ID) {
+    prefs.end();
+    return;
+  }
+
+  auto& s = g_settings;
+  s.touchXMin = prefs.getUShort(kTouchPrefsXMinKey, s.touchXMin);
+  s.touchXMax = prefs.getUShort(kTouchPrefsXMaxKey, s.touchXMax);
+  s.touchYMin = prefs.getUShort(kTouchPrefsYMinKey, s.touchYMin);
+  s.touchYMax = prefs.getUShort(kTouchPrefsYMaxKey, s.touchYMax);
+  prefs.end();
+}
+
+static bool saveTouchToPrefs() {
+  Preferences prefs;
+  if (!prefs.begin(kTouchPrefsNs, false)) {
+    return false;
+  }
+
+  auto& s = g_settings;
+  prefs.putString(kTouchPrefsBoardKey, TOUCH_PROFILE_ID);
+  prefs.putUShort(kTouchPrefsXMinKey, s.touchXMin);
+  prefs.putUShort(kTouchPrefsXMaxKey, s.touchXMax);
+  prefs.putUShort(kTouchPrefsYMinKey, s.touchYMin);
+  prefs.putUShort(kTouchPrefsYMaxKey, s.touchYMax);
+  prefs.end();
+  return true;
+}
+
+bool settingsSaveTouchCalibration() {
+  return saveTouchToPrefs();
+}
+
 const char* settingsBoardProfileId() {
   return TOUCH_PROFILE_ID;
 }
@@ -109,55 +156,58 @@ static bool ensureDir(const char* dirPath) {
 
 bool settingsLoad() {
   settingsApplyBoardTouchDefaults();
-  if (!mountSD()) return false;
-  if (!SD.exists(SETTINGS_PATH)) return true;
+  if (mountSD() && SD.exists(SETTINGS_PATH)) {
+    File f = SD.open(SETTINGS_PATH, FILE_READ);
+    if (f) {
+      StaticJsonDocument<512> doc;
+      DeserializationError err = deserializeJson(doc, f);
+      f.close();
+      if (!err) {
+        auto& s = g_settings;
+        s.brightness      = doc["brightness"]      | s.brightness;
+        s.theme           = (Theme)(uint8_t)(doc["theme"] | (uint8_t)s.theme);
+        s.accentColor     = accentPresetClamp(doc["accentColor"] | s.accentColor);
+        s.neopixelEnabled = doc["neopixelEnabled"] | s.neopixelEnabled;
+        uint8_t sleepVal = (uint8_t)(doc["sleepSeconds"] | s.sleepSeconds);
+        if (!doc.containsKey("sleepSeconds")) {
+          // Backward compatibility with previous key name.
+          sleepVal = (uint8_t)(doc["sleepMinutes"] | sleepVal);
+        }
+        s.sleepSeconds    = normalizeSleepSeconds(sleepVal);
 
-  File f = SD.open(SETTINGS_PATH, FILE_READ);
-  if (!f) return false;
+        s.autoWifiScan    = doc["autoWifiScan"]    | s.autoWifiScan;
+        s.autoBleScan     = doc["autoBleScan"]     | s.autoBleScan;
 
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-  if (err) return false;
+        if (s.autoWifiScan != s.autoBleScan) {
+          bool en = (s.autoWifiScan || s.autoBleScan);
+          s.autoWifiScan = en;
+          s.autoBleScan  = en;
+        }
 
-  auto& s = g_settings;
-  s.brightness      = doc["brightness"]      | s.brightness;
-  s.theme           = (Theme)(uint8_t)(doc["theme"] | (uint8_t)s.theme);
-  s.accentColor     = accentPresetClamp(doc["accentColor"] | s.accentColor);
-  s.neopixelEnabled = doc["neopixelEnabled"] | s.neopixelEnabled;
-  uint16_t sleepVal = (uint16_t)(doc["sleepSeconds"] | s.sleepSeconds);
-  if (!doc.containsKey("sleepSeconds")) {
-    // Backward compatibility with previous key name.
-    sleepVal = (uint8_t)(doc["sleepMinutes"] | sleepVal);
-  }
-  s.sleepSeconds    = normalizeSleepSeconds(sleepVal);
-
-  s.autoWifiScan    = doc["autoWifiScan"]    | s.autoWifiScan;
-  s.autoBleScan     = doc["autoBleScan"]     | s.autoBleScan;
-
-  if (s.autoWifiScan != s.autoBleScan) {
-    bool en = (s.autoWifiScan || s.autoBleScan);
-    s.autoWifiScan = en;
-    s.autoBleScan  = en;
-  }
-
-  if (settingsTouchSavedForBoard(doc)) {
-    JsonObjectConst touch = doc["touch"];
-    s.touchXMin = touch["xMin"] | s.touchXMin;
-    s.touchXMax = touch["xMax"] | s.touchXMax;
-    s.touchYMin = touch["yMin"] | s.touchYMin;
-    s.touchYMax = touch["yMax"] | s.touchYMax;
+        if (settingsTouchSavedForBoard(doc)) {
+          JsonObjectConst touch = doc["touch"];
+          s.touchXMin = touch["xMin"] | s.touchXMin;
+          s.touchXMax = touch["xMax"] | s.touchXMax;
+          s.touchYMin = touch["yMin"] | s.touchYMin;
+          s.touchYMax = touch["yMax"] | s.touchYMax;
 #if defined(BOARD_ESP32_DIV_V2)
-    // Older V2 builds stored Y inverted; normalize that historical layout on load.
-    if (s.touchYMin > s.touchYMax) {
-      uint16_t yMin = s.touchYMin;
-      s.touchYMin = s.touchYMax;
-      s.touchYMax = yMin;
-    }
+          // Older V2 builds stored Y inverted; normalize that historical layout on load.
+          if (s.touchYMin > s.touchYMax) {
+            uint16_t yMin = s.touchYMin;
+            s.touchYMin = s.touchYMax;
+            s.touchYMax = yMin;
+          }
 #endif
-  } else {
-    settingsApplyBoardTouchDefaults();
+        } else {
+          settingsApplyBoardTouchDefaults();
+        }
+      }
+    }
   }
+
+  // Let NVS calibration win over any older SD copy so the latest touch mapping
+  // remains valid even when booting without SD or with stale settings.json.
+  loadTouchFromPrefs();
 
   return true;
 }

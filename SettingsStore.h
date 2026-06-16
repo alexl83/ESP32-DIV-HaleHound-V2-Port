@@ -40,5 +40,6 @@ const char* accentPresetName(uint8_t preset);
 
 const char* settingsBoardProfileId();
 void settingsApplyBoardTouchDefaults();
+bool settingsSaveTouchCalibration();
 bool settingsLoad();
 bool settingsSave();

@@ -2993,11 +2993,12 @@ void loop(){
 #endif
 
     bool ok = settingsSave();
+    bool touchOk = settingsSaveTouchCalibration();
 
     tft.fillScreen(UI_BG);
-    tft.setTextColor(ok ? UI.ok : UI.warn, UI_BG);
+    tft.setTextColor((ok || touchOk) ? UI.ok : UI.warn, UI_BG);
     tft.setCursor(70, 8);
-    tft.print(ok ? "Calibration Saved" : "Save FAILED");
+    tft.print((ok || touchOk) ? "Calibration Saved" : "Save FAILED");
 
     tft.setTextColor(UI_TEXT, UI_BG);
     tft.setCursor(70,28);
