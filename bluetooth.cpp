@@ -3075,7 +3075,11 @@ void updateBLEList() {
       rowTxt = p.mac + " SD";
     } else {
       Tag2ScanEntry entry = filteredScanEntry(idx);
-      rowTxt = entry.valid ? entry.mac + " " + String(entry.rssi) + "dBm" : String("?");
+      if (entry.valid) {
+        rowTxt = entry.mac + " " + String(entry.rssi) + "dBm " + formatDistance(entry.distanceMeters);
+      } else {
+        rowTxt = "?";
+      }
     }
     if (rowTxt.length() > 27) rowTxt = rowTxt.substring(0, 27);
 
