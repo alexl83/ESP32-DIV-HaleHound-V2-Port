@@ -3076,7 +3076,8 @@ void updateBLEList() {
     } else {
       Tag2ScanEntry entry = filteredScanEntry(idx);
       if (entry.valid) {
-        rowTxt = entry.mac + " " + String(entry.rssi) + "dBm " + formatDistance(entry.distanceMeters);
+        // Keep the row compact so MAC, RSSI, and distance fit on one line.
+        rowTxt = entry.mac + " " + String(entry.rssi) + " " + formatDistance(entry.distanceMeters);
       } else {
         rowTxt = "?";
       }
