@@ -2247,7 +2247,18 @@ static void quiesceBleScan() {
   bleScan->clearResults();
   delay(10);
 }
-static std::vector<int> tag2Indices;
+struct Tag2ScanEntry {
+  bool valid = false;
+  String mac = "";
+  String name = "";
+  int rssi = 0;
+  int txPower = 0;
+  float distanceMeters = -1.0f;
+  bool hasTag2Payload = false;
+  uint8_t payload[10] = {0};
+};
+
+static std::vector<Tag2ScanEntry> scanEntries;
 static std::vector<Tag2Profile> loadedProfileList;
 static bool showingLoadedProfiles = false;
 static bool headerIconsDirty = true;
@@ -2263,26 +2274,71 @@ static bool parseTag2Payload(BLEAdvertisedDevice& device, uint8_t out[10]) {
   return true;
 }
 
-static void rebuildTag2Index() {
-  tag2Indices.clear();
+static void rebuildTag2Snapshot() {
+  scanEntries.clear();
   const int total = bleResults.getCount();
   const int cap = min(total, 96);  // avoid heap spikes on huge result sets
+  std::map<String, size_t> byMac;
+
   for (int i = 0; i < cap; i++) {
     BLEAdvertisedDevice d = bleResults.getDevice(i);
     uint8_t p[10];
-    if (parseTag2Payload(d, p)) {
-      tag2Indices.push_back(i);
+    if (!parseTag2Payload(d, p)) {
+      continue;
+    }
+
+    const String mac = String(d.getAddress().toString().c_str());
+    const int rssi = d.getRSSI();
+    const int txPower = d.getTXPower();
+    auto it = byMac.find(mac);
+
+    if (it == byMac.end()) {
+      Tag2ScanEntry e;
+      e.valid = true;
+      e.mac = mac;
+      e.name = d.getName().length() ? String(d.getName().c_str()) : String("");
+      e.rssi = rssi;
+      e.txPower = txPower;
+      e.distanceMeters = (rssi == 0 || distanceN_x10 == 0)
+        ? -1.0f
+        : powf(10.0f, ((float)distanceTxPowerAt1m - (float)rssi) / (10.0f * (((float)distanceN_x10) / 10.0f)));
+      e.hasTag2Payload = true;
+      memcpy(e.payload, p, sizeof(e.payload));
+      byMac[mac] = scanEntries.size();
+      scanEntries.push_back(e);
+      continue;
+    }
+
+    Tag2ScanEntry& e = scanEntries[it->second];
+    if (rssi > e.rssi) {
+      e.rssi = rssi;
+      e.txPower = txPower;
+      e.distanceMeters = (rssi == 0 || distanceN_x10 == 0)
+        ? -1.0f
+        : powf(10.0f, ((float)distanceTxPowerAt1m - (float)rssi) / (10.0f * (((float)distanceN_x10) / 10.0f)));
+      e.name = d.getName().length() ? String(d.getName().c_str()) : e.name;
+      memcpy(e.payload, p, sizeof(e.payload));
+      e.hasTag2Payload = true;
     }
   }
+
+  std::sort(scanEntries.begin(), scanEntries.end(), [](const Tag2ScanEntry& a, const Tag2ScanEntry& b) {
+    if (a.rssi != b.rssi) return a.rssi > b.rssi;
+    if (a.distanceMeters >= 0.0f && b.distanceMeters >= 0.0f && fabsf(a.distanceMeters - b.distanceMeters) > 0.01f) {
+      return a.distanceMeters < b.distanceMeters;
+    }
+    return a.mac < b.mac;
+  });
 }
 
 static int filteredCount() {
   if (showingLoadedProfiles) return (int)loadedProfileList.size();
-  return (int)tag2Indices.size();
+  return (int)scanEntries.size();
 }
 
-static BLEAdvertisedDevice filteredDevice(int filteredIdx) {
-  return bleResults.getDevice(tag2Indices[filteredIdx]);
+static Tag2ScanEntry filteredScanEntry(int filteredIdx) {
+  if (filteredIdx < 0 || filteredIdx >= (int)scanEntries.size()) return Tag2ScanEntry();
+  return scanEntries[filteredIdx];
 }
 
 static Tag2Profile filteredProfile(int filteredIdx) {
@@ -2801,21 +2857,20 @@ static void ensureBleInit() {
 static void cacheProfilesFromCurrentResults() {
   const int n = filteredCount();
   for (int i = 0; i < n; i++) {
-    BLEAdvertisedDevice d = filteredDevice(i);
-    uint8_t p[10];
-    if (!parseTag2Payload(d, p)) continue;
+    const Tag2ScanEntry e = filteredScanEntry(i);
+    if (!e.valid || !e.hasTag2Payload) continue;
     Tag2Profile tp;
     tp.valid = true;
     tp.manualSave = false;
-    tp.mac = String(d.getAddress().toString().c_str());
-    tp.mode = p[2] ? true : false;
-    tp.fast_h = ((uint16_t)p[4] << 8) | p[3];
-    tp.slow_h = ((uint16_t)p[6] << 8) | p[5];
+    tp.mac = e.mac;
+    tp.mode = e.payload[2] ? true : false;
+    tp.fast_h = ((uint16_t)e.payload[4] << 8) | e.payload[3];
+    tp.slow_h = ((uint16_t)e.payload[6] << 8) | e.payload[5];
     tp.state = connectionStateCode;
-    tp.conn = p[7];
-    tp.flags = ((uint16_t)p[8] << 8) | p[9];
-    tp.btn = p[0];
-    tp.batt = (uint8_t)constrain((int)p[1], 0, 100);
+    tp.conn = e.payload[7];
+    tp.flags = ((uint16_t)e.payload[8] << 8) | e.payload[9];
+    tp.btn = e.payload[0];
+    tp.batt = (uint8_t)constrain((int)e.payload[1], 0, 100);
     lastScanProfiles[tp.mac] = tp;
   }
 }
@@ -2825,7 +2880,7 @@ static void liveScanTask(void*) {
   while (liveScanRun) {
     isScanning = true;
     bleResults = bleScan->start(2, false);
-    rebuildTag2Index();
+    rebuildTag2Snapshot();
     cacheProfilesFromCurrentResults();
     liveScanLastUpdateMs = millis();
     liveResultsVersion++;
@@ -2889,7 +2944,7 @@ static void bgBleScanTask(void* ) {
       bgScanActive = true;
       bleScan->clearResults();
       bleResults = bleScan->start(2, false);
-      rebuildTag2Index();
+      rebuildTag2Snapshot();
       bgScanActive = false;
       isScanning = false;
       if (bleResults.getCount() >= 0) {
@@ -2910,7 +2965,7 @@ void startBLEScan() {
   lastScanProfiles.clear();
   loadedProfileList.clear();
   showingLoadedProfiles = false;
-  tag2Indices.clear();
+  scanEntries.clear();
   isDetailView = false;
   current_page = 0;
   currentIndex = 0;
@@ -2922,7 +2977,7 @@ void startBLEScan() {
   isScanning = true;
   bleScan->clearResults();
   bleResults = bleScan->start(5, false);
-  rebuildTag2Index();
+  rebuildTag2Snapshot();
   cacheProfilesFromCurrentResults();
   isScanning = false;
   screenNeedsUpdate = true;
@@ -3019,9 +3074,8 @@ void updateBLEList() {
       Tag2Profile p = filteredProfile(idx);
       rowTxt = p.mac + " SD";
     } else {
-      BLEAdvertisedDevice device = filteredDevice(idx);
-      float dMeters = estimateDistanceMeters(device.getRSSI());
-      rowTxt = "RSSI:" + String(device.getRSSI()) + " D:" + formatDistance(dMeters);
+      Tag2ScanEntry entry = filteredScanEntry(idx);
+      rowTxt = entry.valid ? entry.mac + " " + String(entry.rssi) + "dBm" : String("?");
     }
     if (rowTxt.length() > 27) rowTxt = rowTxt.substring(0, 27);
 
@@ -3141,12 +3195,18 @@ void displayBLEDetails() {
     return;
   }
 
-  BLEAdvertisedDevice device = filteredDevice(currentIndex);
-  String deviceName = device.getName().length() > 0 ? device.getName().c_str() : "Unknown Device";
-  String address = device.getAddress().toString().c_str();
-  int rssi = device.getRSSI();
-  int txPower = device.getTXPower();
-  float dMeters = estimateDistanceMeters(rssi);
+  Tag2ScanEntry device = filteredScanEntry(currentIndex);
+  if (!device.valid) {
+    isDetailView = false;
+    screenNeedsUpdate = true;
+    fullScreenUpdate = true;
+    return;
+  }
+  String deviceName = device.name.length() > 0 ? device.name : "Unknown Device";
+  String address = device.mac;
+  int rssi = device.rssi;
+  int txPower = device.txPower;
+  float dMeters = device.distanceMeters;
 
   tft.setTextColor(WHITE, TFT_BLACK);
   tft.setTextSize(1);
@@ -3167,49 +3227,26 @@ void displayBLEDetails() {
   tft.setCursor(10, y);
   tft.print("Dist: " + formatDistance(dMeters) + " (Tx@" + String((int)distanceTxPowerAt1m) + " n=" + String(((float)distanceN_x10) / 10.0f, 1) + ")");
 
-  if (device.haveServiceUUID()) {
-    y += 20;
-    tft.setCursor(10, y);
-    tft.print("Service UUID: " + String(device.getServiceUUID().toString().c_str()));
-  } else {
-    y += 20;
-    tft.setCursor(10, y);
-    tft.print("No Service UUID");
-  }
-  hasSelectedTag2 = false;
-  if (device.haveManufacturerData()) {
-    String manufacturerData = String((char*)device.getManufacturerData().c_str());
-    y += 20;
-    tft.setCursor(10, y);
-    tft.print("Manufacturer: " + manufacturerData);
-    uint8_t p[10];
-    if (parseTag2Payload(device, p)) {
-      hasSelectedTag2 = true;
-      memcpy(selectedPayload, p, sizeof(selectedPayload));
-      selectedMac = address;
-      buttonPresses = p[0];
-      batteryLevel = (uint8_t)constrain((int)p[1], 0, 100);
-      fastHours = ((uint16_t)p[4] << 8) | p[3];
-      slowHours = ((uint16_t)p[6] << 8) | p[5];
-      connAttempts = p[7];
-      statusFlags = ((uint16_t)p[8] << 8) | p[9];
-      advFastMode = p[2] ? true : false;
-      captureBaselineFromCurrent();
-    }
-  } else {
-    y += 20;
-    tft.setCursor(10, y);
-    tft.print("No Manufacturer Data");
-  }
-  if (device.haveServiceData()) {
-    String serviceData = String((char*)device.getServiceData().c_str());
-    y += 30;
-    tft.setCursor(10, y);
-    tft.print("Service Data: " + serviceData);
-  } else {
-    y += 30;
-    tft.setCursor(10, y);
-    tft.print("No Service Data");
+  y += 20;
+  tft.setCursor(10, y);
+  tft.print("Distance: " + formatDistance(dMeters) + " (Tx@" + String((int)distanceTxPowerAt1m) + " n=" + String(((float)distanceN_x10) / 10.0f, 1) + ")");
+
+  hasSelectedTag2 = device.hasTag2Payload;
+  y += 20;
+  tft.setCursor(10, y);
+  tft.print("Tag2 payload: ");
+  tft.print(hasSelectedTag2 ? "yes" : "no");
+  if (hasSelectedTag2) {
+    memcpy(selectedPayload, device.payload, sizeof(selectedPayload));
+    selectedMac = address;
+    buttonPresses = device.payload[0];
+    batteryLevel = (uint8_t)constrain((int)device.payload[1], 0, 100);
+    fastHours = ((uint16_t)device.payload[4] << 8) | device.payload[3];
+    slowHours = ((uint16_t)device.payload[6] << 8) | device.payload[5];
+    connAttempts = device.payload[7];
+    statusFlags = ((uint16_t)device.payload[8] << 8) | device.payload[9];
+    advFastMode = device.payload[2] ? true : false;
+    captureBaselineFromCurrent();
   }
 
   drawTabBar("Back", false, "", true, "Use", !hasSelectedTag2);
@@ -3327,7 +3364,7 @@ void runUI() {
             ok = loadProfilesFromSdAsScan(true);
             if (ok && !lastScanProfiles.empty()) {
               // Replace current scan results with loaded profiles rendered as scan-like entries.
-              tag2Indices.clear();
+              scanEntries.clear();
               rebuildLoadedProfileListFromCache();
               showingLoadedProfiles = true;
               current_page = 0;
