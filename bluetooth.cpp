@@ -5,8 +5,10 @@
 #include "NimBLEAddress.h"
 #if defined(CONFIG_NIMBLE_CPP_IDF)
 #include "host/ble_hs_id.h"
+#include "host/ble_gap.h"
 #else
 #include "nimble/nimble/host/include/host/ble_hs_id.h"
+#include "nimble/nimble/host/include/host/ble_gap.h"
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -2183,21 +2185,39 @@ static void resetSendPayloadParamsKeepBattery() {
   batteryLevel = keepBattery;
 }
 
+static void beginResetCooldown() {
+  // Arm the guard before touching the advertiser so no UI/config path can restart it.
+  resetCooldownActive = true;
+  resetCooldownResumeMs = millis() + 10000;
+  resetCooldownLastUiMs = 0;
+  lastResetCountdownShown = -1;
+
+  BLEAdvertising* adv = tag2Adv ? tag2Adv : BLEDevice::getAdvertising();
+  if (adv) adv->stop();
+  const int gapRc = ble_gap_adv_stop();
+  Serial.printf("[TAG2] RST advertising stop gap_rc=%d\n", gapRc);
+
+  resetSendPayloadParamsKeepBattery();
+  showNotification("TAG2", "Beacon OFF 10s");
+}
+
 static void drawResetCountdownOverlay() {
-  const int areaX = 116;
-  const int areaY = 290;
-  const int areaW = 66;
+  // Keep the temporary state below the payload controls and clear of the shared footer.
+  const int areaX = 8;
+  const int areaY = 230;
+  const int areaW = SCREEN_WIDTH - 16;
   const int areaH = 11;
   tft.fillRect(areaX, areaY, areaW, areaH, TFT_BLACK);
   if (!resetCooldownActive) return;
   const int32_t leftMs = (int32_t)(resetCooldownResumeMs - millis());
-  char leftBuf[20];
-  snprintf(leftBuf, sizeof(leftBuf), "Off: %lds", (long)max(0, (leftMs + 999) / 1000));
+  char leftBuf[24];
+  snprintf(leftBuf, sizeof(leftBuf), "Beacon off: %lds", (long)max(0, (leftMs + 999) / 1000));
+  tft.setTextFont(1);
+  tft.setTextSize(1);
   tft.setTextColor(ORANGE, TFT_BLACK);
   const int txtW = tft.textWidth(leftBuf);
-  const int rstCenterX = 120 + (57 / 2);
-  const int txtX = rstCenterX - (txtW / 2);
-  tft.setCursor(txtX, 292);
+  const int txtX = (SCREEN_WIDTH - txtW) / 2;
+  tft.setCursor(txtX, 231);
   tft.print(leftBuf);
 }
 
@@ -3027,15 +3047,10 @@ void handleButtons() {
         applySendToAdvertiser();
         screenNeedsUpdate = fullScreenUpdate = true;
       } else if (isButtonPressedEdge(BTN_UP)) {
-        resetSendPayloadParamsKeepBattery();
         if (advEnabled) {
-          if (tag2Adv) tag2Adv->stop();
-          resetCooldownActive = true;
-          resetCooldownResumeMs = millis() + 10000;
-          resetCooldownLastUiMs = 0;
-          lastResetCountdownShown = -1;
-          showNotification("TAG2", "Beacon OFF 10s");
+          beginResetCooldown();
         } else {
+          resetSendPayloadParamsKeepBattery();
           applySendToAdvertiser();
           showNotification("TAG2", "Params reset");
         }
@@ -3532,15 +3547,10 @@ void runUI() {
               screenNeedsUpdate = true;
               lastTouchActionMs = nowMs;
             } else if (x >= 120 && x <= 177) {
-              resetSendPayloadParamsKeepBattery();
               if (advEnabled) {
-                if (tag2Adv) tag2Adv->stop();
-                resetCooldownActive = true;
-                resetCooldownResumeMs = millis() + 10000;
-                resetCooldownLastUiMs = 0;
-                lastResetCountdownShown = -1;
-                showNotification("TAG2", "Beacon OFF 10s");
+                beginResetCooldown();
               } else {
+                resetSendPayloadParamsKeepBattery();
                 applySendToAdvertiser();
                 showNotification("TAG2", "Params reset");
               }
