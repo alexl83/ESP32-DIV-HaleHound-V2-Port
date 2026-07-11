@@ -2084,9 +2084,15 @@ static constexpr int yshift = 30;
 static constexpr int LIST_HEADER_Y = 50;
 static constexpr int LIST_FIRST_ROW_Y = LIST_HEADER_Y + 34;
 static constexpr int LIST_ROW_H = 22;
-static constexpr int LIST_BOTTOM_Y = 300;  // keep clear of tab bar (y=304..320)
-static constexpr int DEVICES_PER_PAGE = (LIST_BOTTOM_Y - LIST_FIRST_ROW_Y) / LIST_ROW_H;
 static int current_page = 0;
+
+static int tag2ListBottomY() {
+  return featureHasTouchNavBar() ? touchNavContentBottomY() - 4 : 300;
+}
+
+static int tag2DevicesPerPage() {
+  return max(1, (tag2ListBottomY() - LIST_FIRST_ROW_Y) / LIST_ROW_H);
+}
 
 unsigned long lastButtonPress = 0;
 const unsigned long debounceTime = 200;
@@ -2219,6 +2225,19 @@ static void drawTinyIconButton(int x, int y, const unsigned char* icon) {
 static void drawTabBar(const char* leftButton, bool leftDisabled,
                        const char* prevButton, bool prevDisabled,
                        const char* nextButton, bool nextDisabled) {
+  if (featureHasTouchNavBar()) {
+    if (isSendView) {
+      setTouchNavLabels("Back", "Mode", "Exit", "Rst", advEnabled ? "Off" : "On");
+    } else if (isDetailView) {
+      setTouchNavLabels("Back", hasSelectedTag2 ? "Use" : nullptr, "Exit", "Prev", "Next");
+    } else {
+      setTouchNavLabels(leftDisabled ? nullptr : "Rescan",
+                        nextDisabled ? nullptr : "Next", "Exit",
+                        prevDisabled ? nullptr : "Prev", "View");
+    }
+    redrawTouchButtonBar();
+    return;
+  }
   tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
   if (leftButton[0]) drawButton(0,   304, 57, 16, leftButton, false, leftDisabled);
   if (prevButton[0]) drawButton(117, 304, 57, 16, prevButton, false, prevDisabled);
@@ -2836,12 +2855,17 @@ static void drawSendView() {
     if (i == 4) drawButton(204, y - 2, 18, 14, "M", false, false);
   }
 
-  // Last row: BACK + MODE + Rst + PW ON/OFF.
-  tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
-  drawButton(0, 304, 57, 16, "Back", false, false);
-  drawButton(60, 304, 57, 16, "Mode", false, false);
-  drawButton(120, 304, 57, 16, "Rst", false, false);
-  drawButton(177, 304, 57, 16, advEnabled ? "On" : "Off", false, false);
+  if (featureHasTouchNavBar()) {
+    setTouchNavLabels("Back", "Mode", "Exit", "Rst", advEnabled ? "Off" : "On");
+    redrawTouchButtonBar();
+  } else {
+    // Legacy fallback for builds without the shared touch navigation bar.
+    tft.fillRect(0, 304, SCREEN_WIDTH, 16, FEATURE_BG);
+    drawButton(0, 304, 57, 16, "Back", false, false);
+    drawButton(60, 304, 57, 16, "Mode", false, false);
+    drawButton(120, 304, 57, 16, "Rst", false, false);
+    drawButton(177, 304, 57, 16, advEnabled ? "On" : "Off", false, false);
+  }
 
   drawResetCountdownOverlay();
 }
@@ -2989,12 +3013,88 @@ void handleButtons() {
 
   int oldPage = current_page;
 
+  if (featureHasTouchNavBar()) {
+    const int deviceCount = filteredCount();
+    const int perPage = tag2DevicesPerPage();
+
+    if (isSendView) {
+      if (isButtonPressedEdge(BTN_LEFT)) {
+        isSendView = false;
+        isDetailView = false;
+        screenNeedsUpdate = fullScreenUpdate = true;
+      } else if (isButtonPressedEdge(BTN_DOWN)) {
+        advFastMode = !advFastMode;
+        applySendToAdvertiser();
+        screenNeedsUpdate = fullScreenUpdate = true;
+      } else if (isButtonPressedEdge(BTN_UP)) {
+        resetSendPayloadParamsKeepBattery();
+        if (advEnabled) {
+          if (tag2Adv) tag2Adv->stop();
+          resetCooldownActive = true;
+          resetCooldownResumeMs = millis() + 10000;
+          resetCooldownLastUiMs = 0;
+          lastResetCountdownShown = -1;
+          showNotification("TAG2", "Beacon OFF 10s");
+        } else {
+          applySendToAdvertiser();
+          showNotification("TAG2", "Params reset");
+        }
+        screenNeedsUpdate = fullScreenUpdate = true;
+      } else if (isButtonPressedEdge(BTN_RIGHT)) {
+        advEnabled = !advEnabled;
+        applySendToAdvertiser();
+        screenNeedsUpdate = fullScreenUpdate = true;
+      }
+      lastButtonPress = currentMillis;
+      return;
+    }
+
+    if (isDetailView) {
+      if (isButtonPressedEdge(BTN_LEFT)) {
+        isDetailView = false;
+        screenNeedsUpdate = fullScreenUpdate = true;
+      } else if (isButtonPressedEdge(BTN_DOWN) && hasSelectedTag2) {
+        isSendView = true;
+        isDetailView = false;
+        applySendToAdvertiser();
+        screenNeedsUpdate = fullScreenUpdate = true;
+      } else if (isButtonPressedEdge(BTN_UP) && currentIndex > 0) {
+        currentIndex--;
+        screenNeedsUpdate = fullScreenUpdate = true;
+      } else if (isButtonPressedEdge(BTN_RIGHT) && currentIndex + 1 < deviceCount) {
+        currentIndex++;
+        screenNeedsUpdate = fullScreenUpdate = true;
+      }
+      lastButtonPress = currentMillis;
+      return;
+    }
+
+    if (isButtonPressedEdge(BTN_LEFT)) {
+      if (!isScanning) startBLEScan();
+    } else if (isButtonPressedEdge(BTN_DOWN) && (current_page + 1) * perPage < deviceCount) {
+      current_page++;
+      currentIndex = current_page * perPage;
+      listStartIndex = currentIndex;
+      screenNeedsUpdate = fullScreenUpdate = true;
+    } else if (isButtonPressedEdge(BTN_UP) && current_page > 0) {
+      current_page--;
+      currentIndex = current_page * perPage;
+      listStartIndex = currentIndex;
+      screenNeedsUpdate = fullScreenUpdate = true;
+    } else if (isButtonPressedEdge(BTN_RIGHT) && deviceCount > 0) {
+      isDetailView = true;
+      screenNeedsUpdate = fullScreenUpdate = true;
+    }
+    lastButtonPress = currentMillis;
+    return;
+  }
+
   if (!pcf.digitalRead(BTN_UP)) {
     if (!isDetailView && currentIndex > 0) {
       currentIndex--;
       delay(200);
-      current_page = currentIndex / max(1, DEVICES_PER_PAGE);
-      listStartIndex = current_page * DEVICES_PER_PAGE;
+      current_page = currentIndex / tag2DevicesPerPage();
+      listStartIndex = current_page * tag2DevicesPerPage();
       screenNeedsUpdate = true;
       fullScreenUpdate = (current_page != oldPage);
     }
@@ -3005,8 +3105,8 @@ void handleButtons() {
     if (!isDetailView && currentIndex < filteredCount() - 1) {
       currentIndex++;
       delay(200);
-      current_page = currentIndex / max(1, DEVICES_PER_PAGE);
-      listStartIndex = current_page * DEVICES_PER_PAGE;
+      current_page = currentIndex / tag2DevicesPerPage();
+      listStartIndex = current_page * tag2DevicesPerPage();
       screenNeedsUpdate = true;
       fullScreenUpdate = (current_page != oldPage);
     }
@@ -3053,17 +3153,18 @@ void updateBLEList() {
     return;
   }
 
-  const int totalPages = (deviceCount + DEVICES_PER_PAGE - 1) / DEVICES_PER_PAGE;
+  const int devicesPerPage = tag2DevicesPerPage();
+  const int totalPages = (deviceCount + devicesPerPage - 1) / devicesPerPage;
   if (current_page < 0) current_page = 0;
   if (current_page > totalPages - 1) current_page = max(0, totalPages - 1);
-  listStartIndex = current_page * DEVICES_PER_PAGE;
+  listStartIndex = current_page * devicesPerPage;
 
   static int last_rendered_page = -1;
   static int last_rendered_index = -1;
 
   auto drawRow = [&](int idx, bool selected) {
     if (idx < 0 || idx >= deviceCount) return;
-    if (idx < listStartIndex || idx >= listStartIndex + DEVICES_PER_PAGE) return;
+    if (idx < listStartIndex || idx >= listStartIndex + devicesPerPage) return;
     const int row = idx - listStartIndex;
     const int y = LIST_FIRST_ROW_Y + row * LIST_ROW_H;
 
@@ -3128,13 +3229,13 @@ void updateBLEList() {
     tft.setTextColor(GREEN);
     tft.println(page_buf);
 
-    const int end_index = min(listStartIndex + DEVICES_PER_PAGE, deviceCount);
+    const int end_index = min(listStartIndex + devicesPerPage, deviceCount);
     for (int i = listStartIndex; i < end_index; i++) {
       drawRow(i, (i == currentIndex));
     }
 
     const bool prevDisabled = (current_page == 0);
-    const bool nextDisabled = ((current_page + 1) * DEVICES_PER_PAGE >= deviceCount);
+    const bool nextDisabled = ((current_page + 1) * devicesPerPage >= deviceCount);
     drawTabBar("Rescan", false, "Prev", prevDisabled, "Next", nextDisabled);
 
     last_rendered_page = current_page;
@@ -3411,6 +3512,11 @@ void runUI() {
           }
         }
       } else if (!isScanning) {
+        // The shared footer owns this strip and dispatches it through button events.
+        if (featureHasTouchNavBar() && y >= touchNavContentBottomY()) {
+          lastTouchCheck = millis();
+          return;
+        }
         if (isSendView) {
           // Last row controls in SEND: BACK, MODE, Rst, PW ON/OFF.
           if (y >= 304 && y <= 320) {
@@ -3496,7 +3602,8 @@ void runUI() {
           // Deauther-like bottom bar has a large touch hitbox.
           if (y >= 290 && y <= 320) {
             const bool prevDisabled = (current_page == 0);
-            const bool nextDisabled = ((current_page + 1) * DEVICES_PER_PAGE >= deviceCount);
+            const int devicesPerPage = tag2DevicesPerPage();
+            const bool nextDisabled = ((current_page + 1) * devicesPerPage >= deviceCount);
 
             if (x >= 0 && x <= 57) {
               if (isDetailView) {
@@ -3515,8 +3622,8 @@ void runUI() {
               drawButton(117, 304, 57, 16, "Prev", true, false);
               current_page--;
               if (current_page < 0) current_page = 0;
-              currentIndex = current_page * DEVICES_PER_PAGE;
-              listStartIndex = current_page * DEVICES_PER_PAGE;
+              currentIndex = current_page * devicesPerPage;
+              listStartIndex = current_page * devicesPerPage;
               screenNeedsUpdate = true;
               fullScreenUpdate = true;
               lastTouchActionMs = nowMs;
@@ -3535,8 +3642,8 @@ void runUI() {
               } else if (!nextDisabled) {
                 drawButton(177, 304, 57, 16, "Next", true, false);
                 current_page++;
-                currentIndex = current_page * DEVICES_PER_PAGE;
-                listStartIndex = current_page * DEVICES_PER_PAGE;
+                currentIndex = current_page * devicesPerPage;
+                listStartIndex = current_page * devicesPerPage;
                 screenNeedsUpdate = true;
                 fullScreenUpdate = true;
                 lastTouchActionMs = nowMs;
@@ -3571,10 +3678,11 @@ void runUI() {
                 lastTouchActionMs = nowMs;
               }
             }
-            const int listMaxY = LIST_FIRST_ROW_Y + (DEVICES_PER_PAGE * LIST_ROW_H);
+            const int devicesPerPage = tag2DevicesPerPage();
+            const int listMaxY = LIST_FIRST_ROW_Y + (devicesPerPage * LIST_ROW_H);
             if (deviceCount > 0 && y >= LIST_FIRST_ROW_Y && y < listMaxY) {
               const int row = (y - LIST_FIRST_ROW_Y) / LIST_ROW_H;
-              const int idx = (current_page * DEVICES_PER_PAGE) + row;
+              const int idx = (current_page * devicesPerPage) + row;
               if (idx >= 0 && idx < deviceCount) {
                 currentIndex = idx;
                 isDetailView = true;
@@ -3593,6 +3701,9 @@ void runUI() {
 
 void bleScanSetup() {
 
+  setTouchButtonInputEnabled(true);
+  setTouchNavLabels("Rescan", "Next", "Exit", nullptr, "View");
+  resetTouchNavHeldState();
   tft.fillScreen(TFT_BLACK);
 
   uiDrawn = false;
@@ -3600,6 +3711,7 @@ void bleScanSetup() {
   float currentBatteryVoltage = readBatteryVoltage();
   drawStatusBar(currentBatteryVoltage, true);
   runUI();
+  redrawTouchButtonBar();
 
   setupTouchscreen();
   loadRfModelFromSd();
