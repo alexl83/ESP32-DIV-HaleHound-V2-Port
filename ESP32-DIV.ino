@@ -371,7 +371,7 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "Sour Apple",
     "Sniffer",
     "BLE Scanner",
-    "iBeacon Detector",
+    "Beacon Detector",
     "BLE Tag2 Tool",
     "BLE Rubber Ducky",
     "Back to Main Menu"};

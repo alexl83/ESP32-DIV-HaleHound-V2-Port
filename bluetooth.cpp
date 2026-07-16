@@ -5119,10 +5119,19 @@ void prokillLoop() {
 namespace IBeaconDetector {
 
 struct Beacon {
+  enum class Type : uint8_t {
+    IBEACON,
+    ALTBEACON,
+    EDDYSTONE_UID,
+    EDDYSTONE_URL,
+    EDDYSTONE_TLM,
+    EDDYSTONE_EID
+  };
+
+  Type type;
   String address;
-  String uuid;
-  uint16_t major;
-  uint16_t minor;
+  String id;
+  String extra;
   int8_t measuredPower;
   int rssi;
   float distance;
@@ -5144,31 +5153,159 @@ static String formatUuid(const uint8_t* p) {
   return String(out);
 }
 
-static float estimateDistance(int rssi, int8_t measuredPower) {
-  if (rssi == 0 || measuredPower == 0) return -1.0f;
-  const float ratio = (float)rssi / (float)measuredPower;
+static String hexBytes(const uint8_t* p, size_t length) {
+  static const char hex[] = "0123456789ABCDEF";
+  String out;
+  out.reserve(length * 2);
+  for (size_t i = 0; i < length; ++i) {
+    out += hex[p[i] >> 4];
+    out += hex[p[i] & 0x0F];
+  }
+  return out;
+}
+
+static const char* typeName(Beacon::Type type) {
+  switch (type) {
+    case Beacon::Type::IBEACON:       return "iBeacon";
+    case Beacon::Type::ALTBEACON:     return "AltBeacon";
+    case Beacon::Type::EDDYSTONE_UID: return "Eddystone UID";
+    case Beacon::Type::EDDYSTONE_URL: return "Eddystone URL";
+    case Beacon::Type::EDDYSTONE_TLM: return "Eddystone TLM";
+    case Beacon::Type::EDDYSTONE_EID: return "Eddystone EID";
+  }
+  return "Beacon";
+}
+
+static float estimateDistance(int rssi, int referenceRssiAtOneMeter) {
+  if (rssi == 0 || referenceRssiAtOneMeter == 0) return -1.0f;
+  const float ratio = (float)rssi / (float)referenceRssiAtOneMeter;
   if (ratio < 1.0f) return powf(ratio, 10.0f);
   return 0.89976f * powf(ratio, 7.7095f) + 0.111f;
 }
 
-static bool parse(BLEAdvertisedDevice& device, Beacon& out) {
+static bool parseManufacturerBeacon(BLEAdvertisedDevice& device, Beacon& out) {
   if (!device.haveManufacturerData()) return false;
   const std::string data = device.getManufacturerData();
-  if (data.size() < 25) return false;
-
   const uint8_t* p = reinterpret_cast<const uint8_t*>(data.data());
-  if (p[0] != 0x4C || p[1] != 0x00 || p[2] != 0x02 || p[3] != 0x15) {
-    return false;
-  }
 
   out.address = device.getAddress().toString().c_str();
-  out.uuid = formatUuid(p + 4);
-  out.major = ((uint16_t)p[20] << 8) | p[21];
-  out.minor = ((uint16_t)p[22] << 8) | p[23];
-  out.measuredPower = (int8_t)p[24];
   out.rssi = device.getRSSI();
-  out.distance = estimateDistance(out.rssi, out.measuredPower);
-  return true;
+
+  if (data.size() >= 25 &&
+      p[0] == 0x4C && p[1] == 0x00 && p[2] == 0x02 && p[3] == 0x15) {
+    out.type = Beacon::Type::IBEACON;
+    out.id = formatUuid(p + 4);
+    const uint16_t major = ((uint16_t)p[20] << 8) | p[21];
+    const uint16_t minor = ((uint16_t)p[22] << 8) | p[23];
+    out.extra = "Major " + String(major) + "  Minor " + String(minor);
+    out.measuredPower = (int8_t)p[24];
+    out.distance = estimateDistance(out.rssi, out.measuredPower);
+    return true;
+  }
+
+  // Manufacturer ID is vendor-specific; AltBeacon is identified by its
+  // big-endian beacon code 0xBEAC immediately after that ID.
+  if (data.size() >= 26 && p[2] == 0xBE && p[3] == 0xAC) {
+    out.type = Beacon::Type::ALTBEACON;
+    out.id = hexBytes(p + 4, 20);
+    out.extra = "MFG 0x" + hexBytes(p, 2) + "  RSV 0x" + hexBytes(p + 25, 1);
+    out.measuredPower = (int8_t)p[24];
+    out.distance = estimateDistance(out.rssi, out.measuredPower);
+    return true;
+  }
+
+  return false;
+}
+
+static String decodeEddystoneUrl(const uint8_t* p, size_t length) {
+  static const char* schemes[] = {
+    "http://www.", "https://www.", "http://", "https://"
+  };
+  static const char* expansions[] = {
+    ".com/", ".org/", ".edu/", ".net/", ".info/", ".biz/", ".gov/",
+    ".com", ".org", ".edu", ".net", ".info", ".biz", ".gov"
+  };
+  if (length == 0 || p[0] > 3) return "Invalid URL";
+
+  String url = schemes[p[0]];
+  for (size_t i = 1; i < length; ++i) {
+    if (p[i] <= 13) {
+      url += expansions[p[i]];
+    } else if (p[i] >= 0x21 && p[i] <= 0x7E) {
+      url += (char)p[i];
+    }
+  }
+  return url;
+}
+
+static bool parseEddystone(BLEAdvertisedDevice& device, Beacon& out) {
+  if (!device.haveServiceData()) return false;
+
+  for (uint8_t i = 0; i < device.getServiceDataCount(); ++i) {
+    if (!(device.getServiceDataUUID(i) == BLEUUID((uint16_t)0xFEAA))) continue;
+    const std::string data = device.getServiceData(i);
+    if (data.empty()) continue;
+
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data.data());
+    out.address = device.getAddress().toString().c_str();
+    out.rssi = device.getRSSI();
+    out.measuredPower = 0;
+    out.distance = -1.0f;
+
+    switch (p[0]) {
+      case 0x00:
+        if (data.size() < 18) return false;
+        out.type = Beacon::Type::EDDYSTONE_UID;
+        out.measuredPower = (int8_t)p[1];
+        out.id = hexBytes(p + 2, 10);
+        out.extra = "Instance " + hexBytes(p + 12, 6);
+        out.distance = estimateDistance(out.rssi, (int)out.measuredPower - 41);
+        return true;
+
+      case 0x10:
+        if (data.size() < 3) return false;
+        out.type = Beacon::Type::EDDYSTONE_URL;
+        out.measuredPower = (int8_t)p[1];
+        out.id = decodeEddystoneUrl(p + 2, data.size() - 2);
+        out.extra = "Compressed URL frame";
+        out.distance = estimateDistance(out.rssi, (int)out.measuredPower - 41);
+        return true;
+
+      case 0x20:
+        if (data.size() < 14) return false;
+        out.type = Beacon::Type::EDDYSTONE_TLM;
+        {
+          const uint16_t batteryMv = ((uint16_t)p[2] << 8) | p[3];
+          const int16_t tempRaw = (int16_t)(((uint16_t)p[4] << 8) | p[5]);
+          const uint32_t advCount = ((uint32_t)p[6] << 24) |
+                                    ((uint32_t)p[7] << 16) |
+                                    ((uint32_t)p[8] << 8) | p[9];
+          const uint32_t uptimeTenths = ((uint32_t)p[10] << 24) |
+                                       ((uint32_t)p[11] << 16) |
+                                       ((uint32_t)p[12] << 8) | p[13];
+          out.id = "Battery " + String(batteryMv) + " mV";
+          out.extra = "Temp " + String(tempRaw / 256.0f, 1) +
+                      " C  Adv " + String(advCount) +
+                      "  Up " + String(uptimeTenths / 10) + "s";
+        }
+        return true;
+
+      case 0x30:
+        if (data.size() < 10) return false;
+        out.type = Beacon::Type::EDDYSTONE_EID;
+        out.measuredPower = (int8_t)p[1];
+        out.id = hexBytes(p + 2, 8);
+        out.extra = "Ephemeral identifier";
+        out.distance = estimateDistance(out.rssi, (int)out.measuredPower - 41);
+        return true;
+    }
+  }
+
+  return false;
+}
+
+static bool parse(BLEAdvertisedDevice& device, Beacon& out) {
+  return parseManufacturerBeacon(device, out) || parseEddystone(device, out);
 }
 
 static void setNavLabels() {
@@ -5183,7 +5320,7 @@ static void drawHeader() {
   tft.setTextSize(1);
   tft.setTextColor(GREEN, TFT_BLACK);
   tft.setCursor(8, 42);
-  tft.printf("iBeacon Detector  Found: %u", (unsigned)beacons.size());
+  tft.printf("Beacon Detector  Found: %u", (unsigned)beacons.size());
   tft.drawFastHLine(0, 54, 240, UI_LINE);
 }
 
@@ -5192,7 +5329,7 @@ static void drawList() {
   if (beacons.empty()) {
     tft.setTextColor(WHITE, TFT_BLACK);
     tft.setCursor(10, 70);
-    tft.println("No iBeacon advertisements found.");
+    tft.println("No supported beacons found.");
     tft.setCursor(10, 84);
     tft.println("Press Scan to try again.");
     return;
@@ -5206,11 +5343,11 @@ static void drawList() {
     const int y = 64 + (i - first) * 28;
     tft.setTextColor(i == selected ? ORANGE : WHITE, TFT_BLACK);
     tft.setCursor(8, y);
-    tft.printf("%c %u/%u  %d dBm", i == selected ? '>' : ' ',
-               b.major, b.minor, b.rssi);
+    tft.printf("%c %-14s %d dBm", i == selected ? '>' : ' ',
+               typeName(b.type), b.rssi);
     tft.setTextColor(uiDimTextColor(), TFT_BLACK);
     tft.setCursor(18, y + 12);
-    tft.print(b.uuid.substring(0, 18));
+    tft.print(b.id.substring(0, 28));
   }
 }
 
@@ -5234,17 +5371,18 @@ static void drawDetail() {
     y += 19;
   };
 
+  line("Type", typeName(b.type));
   line("MAC", b.address);
   tft.setTextColor(uiDimTextColor(), TFT_BLACK);
-  tft.setCursor(8, y); tft.print("UUID");
+  tft.setCursor(8, y); tft.print("ID");
   tft.setTextColor(WHITE, TFT_BLACK);
-  tft.setCursor(8, y + 13); tft.print(b.uuid.substring(0, 18));
-  tft.setCursor(8, y + 26); tft.print(b.uuid.substring(18));
+  tft.setCursor(8, y + 13); tft.print(b.id.substring(0, 30));
+  tft.setCursor(8, y + 26); tft.print(b.id.substring(30, 60));
   y += 48;
-  line("Major", String(b.major));
-  line("Minor", String(b.minor));
+  line("Info", b.extra.substring(0, 28));
+  if (b.extra.length() > 28) line("", b.extra.substring(28, 56));
   line("RSSI", String(b.rssi) + " dBm");
-  line("TX", String((int)b.measuredPower) + " dBm");
+  line("TX/Ref", b.measuredPower == 0 ? "n/a" : String((int)b.measuredPower) + " dBm");
   line("Range", b.distance < 0 ? "n/a" : String(b.distance, 2) + " m (est.)");
 }
 
