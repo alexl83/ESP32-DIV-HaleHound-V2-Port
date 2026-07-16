@@ -5116,6 +5116,222 @@ void prokillLoop() {
 
 }  // namespace ProtoKill
 
+namespace IBeaconDetector {
+
+struct Beacon {
+  String address;
+  String uuid;
+  uint16_t major;
+  uint16_t minor;
+  int8_t measuredPower;
+  int rssi;
+  float distance;
+};
+
+static std::vector<Beacon> beacons;
+static BLEScan* scan = nullptr;
+static int selected = 0;
+static bool detail = false;
+static bool redraw = true;
+static uint32_t lastInputMs = 0;
+
+static String formatUuid(const uint8_t* p) {
+  char out[37];
+  snprintf(out, sizeof(out),
+           "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+           p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+           p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+  return String(out);
+}
+
+static float estimateDistance(int rssi, int8_t measuredPower) {
+  if (rssi == 0 || measuredPower == 0) return -1.0f;
+  const float ratio = (float)rssi / (float)measuredPower;
+  if (ratio < 1.0f) return powf(ratio, 10.0f);
+  return 0.89976f * powf(ratio, 7.7095f) + 0.111f;
+}
+
+static bool parse(BLEAdvertisedDevice& device, Beacon& out) {
+  if (!device.haveManufacturerData()) return false;
+  const std::string data = device.getManufacturerData();
+  if (data.size() < 25) return false;
+
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(data.data());
+  if (p[0] != 0x4C || p[1] != 0x00 || p[2] != 0x02 || p[3] != 0x15) {
+    return false;
+  }
+
+  out.address = device.getAddress().toString().c_str();
+  out.uuid = formatUuid(p + 4);
+  out.major = ((uint16_t)p[20] << 8) | p[21];
+  out.minor = ((uint16_t)p[22] << 8) | p[23];
+  out.measuredPower = (int8_t)p[24];
+  out.rssi = device.getRSSI();
+  out.distance = estimateDistance(out.rssi, out.measuredPower);
+  return true;
+}
+
+static void setNavLabels() {
+  setTouchNavLabels("Scan", "Prev", "Exit", "Next", detail ? "Back" : "View");
+  redrawTouchButtonBar();
+}
+
+static void drawHeader() {
+  bleClearBody(TFT_BLACK);
+  drawStatusBar(readBatteryVoltage(), true);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(GREEN, TFT_BLACK);
+  tft.setCursor(8, 42);
+  tft.printf("iBeacon Detector  Found: %u", (unsigned)beacons.size());
+  tft.drawFastHLine(0, 54, 240, UI_LINE);
+}
+
+static void drawList() {
+  drawHeader();
+  if (beacons.empty()) {
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setCursor(10, 70);
+    tft.println("No iBeacon advertisements found.");
+    tft.setCursor(10, 84);
+    tft.println("Press Scan to try again.");
+    return;
+  }
+
+  const int rows = max(1, (bleContentBottom() - 64) / 28);
+  const int first = (selected / rows) * rows;
+  const int end = min((int)beacons.size(), first + rows);
+  for (int i = first; i < end; ++i) {
+    const Beacon& b = beacons[i];
+    const int y = 64 + (i - first) * 28;
+    tft.setTextColor(i == selected ? ORANGE : WHITE, TFT_BLACK);
+    tft.setCursor(8, y);
+    tft.printf("%c %u/%u  %d dBm", i == selected ? '>' : ' ',
+               b.major, b.minor, b.rssi);
+    tft.setTextColor(uiDimTextColor(), TFT_BLACK);
+    tft.setCursor(18, y + 12);
+    tft.print(b.uuid.substring(0, 18));
+  }
+}
+
+static void drawDetail() {
+  drawHeader();
+  if (beacons.empty()) {
+    detail = false;
+    drawList();
+    return;
+  }
+
+  const Beacon& b = beacons[selected];
+  int y = 66;
+  auto line = [&](const String& label, const String& value) {
+    tft.setTextColor(uiDimTextColor(), TFT_BLACK);
+    tft.setCursor(8, y);
+    tft.print(label);
+    tft.setTextColor(WHITE, TFT_BLACK);
+    tft.setCursor(64, y);
+    tft.print(value);
+    y += 19;
+  };
+
+  line("MAC", b.address);
+  tft.setTextColor(uiDimTextColor(), TFT_BLACK);
+  tft.setCursor(8, y); tft.print("UUID");
+  tft.setTextColor(WHITE, TFT_BLACK);
+  tft.setCursor(8, y + 13); tft.print(b.uuid.substring(0, 18));
+  tft.setCursor(8, y + 26); tft.print(b.uuid.substring(18));
+  y += 48;
+  line("Major", String(b.major));
+  line("Minor", String(b.minor));
+  line("RSSI", String(b.rssi) + " dBm");
+  line("TX", String((int)b.measuredPower) + " dBm");
+  line("Range", b.distance < 0 ? "n/a" : String(b.distance, 2) + " m (est.)");
+}
+
+static void performScan() {
+  pauseBackgroundRadioTasks();
+  beacons.clear();
+  selected = 0;
+  detail = false;
+  redraw = true;
+  setNavLabels();
+
+  drawHeader();
+  tft.setTextColor(ORANGE, TFT_BLACK);
+  tft.setCursor(10, 72);
+  tft.println("Scanning BLE advertisements...");
+
+  scan = BLEDevice::getScan();
+  scan->stop();
+  scan->clearResults();
+  scan->setActiveScan(true);
+  BLEScanResults results = scan->start(5, false);
+
+  for (int i = 0; i < results.getCount(); ++i) {
+    BLEAdvertisedDevice device = results.getDevice(i);
+    Beacon beacon;
+    if (parse(device, beacon)) beacons.push_back(beacon);
+  }
+  std::sort(beacons.begin(), beacons.end(),
+            [](const Beacon& a, const Beacon& b) { return a.rssi > b.rssi; });
+}
+
+void setup() {
+  BleSniffer::exit();
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  setupTouchscreen();
+  setNavLabels();
+  performScan();
+}
+
+void loop() {
+  if (featureExitButtonPressed()) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  updateStatusBar();
+  const uint32_t now = millis();
+  if (now - lastInputMs >= 200) {
+    if (isButtonPressed(BTN_LEFT)) {
+      lastInputMs = now;
+      performScan();
+    } else if (isButtonPressed(BTN_UP) && selected > 0) {
+      --selected;
+      lastInputMs = now;
+      redraw = true;
+    } else if (isButtonPressed(BTN_DOWN) && selected + 1 < (int)beacons.size()) {
+      ++selected;
+      lastInputMs = now;
+      redraw = true;
+    } else if (isButtonPressed(BTN_RIGHT) && !beacons.empty()) {
+      detail = !detail;
+      lastInputMs = now;
+      setNavLabels();
+      redraw = true;
+    }
+  }
+
+  if (redraw) {
+    redraw = false;
+    if (detail) drawDetail(); else drawList();
+    redrawTouchButtonBar();
+  }
+  delay(10);
+}
+
+void exit() {
+  if (scan) {
+    scan->stop();
+    scan->clearResults();
+  }
+  beacons.clear();
+  detail = false;
+  redraw = true;
+}
+}
+
 namespace BleSniffer {
 
 #define SCREEN_WIDTH  240

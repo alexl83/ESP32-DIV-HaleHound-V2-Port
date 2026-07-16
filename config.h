@@ -75,6 +75,11 @@ namespace BleTag2 {
   void bleScanLoop();
   void exit();
 }
+namespace IBeaconDetector {
+  void setup();
+  void loop();
+  void exit();
+}
 namespace Scanner {
   void scannerSetup();
   void scannerLoop();
