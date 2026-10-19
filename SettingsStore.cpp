@@ -9,7 +9,7 @@ static AppSettings g_settings;
 AppSettings& settings() { return g_settings; }
 static const AccentOption kAccentPresets[] = {
   {"Orange", 0xFBE4},
-  {"Green",  0x07E0},
+  {"Green",  0xB721},
   {"Red",    0xF800},
   {"Cyan",   0x07FF},
   {"Purple", 0xF81F},
@@ -119,26 +119,12 @@ static bool sd_mounted = false;
 static bool mountSD() {
 
   if (sd_mounted) {
-    if (SD.exists("/")) return true;
+    if (SD.cardType() != CARD_NONE) return true;
     sd_mounted = false;
   }
 
-  sdSpiInit();
-
-  #ifdef SD_CS
-  if (sdMountChipSelect(SD_CS)) { sd_mounted = true; return true; }
-  #endif
-  #ifdef SD_CS_PIN
-
-  #ifdef CC1101_CS
-  if (SD_CS_PIN != CC1101_CS) {
-    if (sdMountChipSelect(SD_CS_PIN)) { sd_mounted = true; return true; }
-  }
-  #else
-  if (sdMountChipSelect(SD_CS_PIN)) { sd_mounted = true; return true; }
-  #endif
-  #endif
-  return false;
+  sd_mounted = isSDCardAvailable();
+  return sd_mounted;
 }
 
 static bool ensureDir(const char* dirPath) {
@@ -156,6 +142,7 @@ static bool ensureDir(const char* dirPath) {
 
 bool settingsLoad() {
   settingsApplyBoardTouchDefaults();
+  sdRetryMount();
   if (mountSD() && SD.exists(SETTINGS_PATH)) {
     File f = SD.open(SETTINGS_PATH, FILE_READ);
     if (f) {
@@ -213,6 +200,7 @@ bool settingsLoad() {
 }
 
 bool settingsSave() {
+  sdRetryMount();
 
   if (!ensureDir("/config")) {
     sd_mounted = false;

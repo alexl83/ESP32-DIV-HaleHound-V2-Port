@@ -61,6 +61,24 @@ namespace SourApple {
   void sourappleLoop();
   void exit();
 }
+namespace AirTagSpoofer {
+  void airTagSetup();
+  void airTagLoop();
+  void exit();
+}
+namespace AirTagSniffer {
+  void airTagSnifferSetup();
+  void airTagSnifferLoop();
+  void exit();
+}
+namespace BleSkimmer {
+  void bleSkimmerSetup();
+  void bleSkimmerLoop();
+  void exit();
+}
+/** Init NimBLE once (releases unused Classic BT RAM first). Safe to call repeatedly. */
+bool ensureBleStackReady();
+
 namespace BleScan {
   void bleScanSetup();
   void bleScanLoop();
@@ -78,10 +96,32 @@ namespace BleTag2 {
 namespace Scanner {
   void scannerSetup();
   void scannerLoop();
+  void exit();
 }
 namespace ProtoKill {
   void prokillSetup();
   void prokillLoop();
+  void exit();
+}
+namespace EsbSniffer {
+  void esbSnifferSetup();
+  void esbSnifferLoop();
+  void exit();
+}
+namespace EsbReplay {
+  void esbReplaySetup();
+  void esbReplayLoop();
+  void exit();
+}
+namespace MouseJack {
+  void mouseJackSetup();
+  void mouseJackLoop();
+  void exit();
+}
+namespace MouseJackInject {
+  void mouseJackInjectSetup();
+  void mouseJackInjectLoop();
+  void exit();
 }
 namespace WLANJammer {
   inline void wlanjammerSetup() { ProtoKill::prokillSetup(); }
@@ -108,6 +148,14 @@ namespace SavedProfile {
 namespace subjammer {
   void subjammerSetup();
   void subjammerLoop();
+}
+namespace SubBrute {
+  void subBruteSetup();
+  void subBruteLoop();
+}
+namespace jammingdetector {
+  void Setup();
+  void Loop();
 }
 
 /* ───────────── WiFi namespaces ───────────── */
@@ -146,6 +194,22 @@ namespace Deauther {
 namespace ProbeRequestFlood {
   void probeRequestFloodSetup();
   void probeRequestFloodLoop();
+}
+namespace HiddenSsidReveal {
+  void hiddenSsidSetup();
+  void hiddenSsidLoop();
+}
+namespace WpsScanner {
+  void wpsScannerSetup();
+  void wpsScannerLoop();
+}
+namespace ArpScanner {
+  void arpScannerSetup();
+  void arpScannerLoop();
+}
+namespace KarmaAttack {
+  void karmaSetup();
+  void karmaLoop();
 }
 namespace FirmwareUpdate {
   void updateSetup();
